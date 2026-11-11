@@ -15,7 +15,7 @@ sends it to the network as **NDI** or **OMT**. Each tile shows:
   has been down, and that it keeps retrying
 
 A clock sits in the middle so a frozen picture is obvious. You can put a line of text under it
-(e.g. `TALLINN LOCAL TIME` or `STILL FRAME TALLINN PLAYOUT`).
+(e.g. `TALLINN LOCAL TIME`)
 
 An empty channel is retried every 10 s (`reconnect_delay`) and keeps showing NO SIGNAL while
 retrying, so it lights up on its own as soon as someone starts streaming to it. A feed that was
