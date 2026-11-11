@@ -80,7 +80,8 @@ estimates; I haven't measured on that hardware.
 
 1. Install Debian 12/13 with Xfce, plug in Ethernet (the Wi-Fi needs non-free Broadcom
    drivers, and you want cable anyway), and enable auto-login for the user.
-2. `./install.sh --autostart --no-service` (add `--ndi` if it should also send NDI).
+2. `./install.sh --autostart --no-service` (add `--omt` or `--ndi` if it should also send the
+   multiview to the network).
    It boots straight into the fullscreen multiview. The config is
    `~/.config/rtmp-multiview/config.json`.
 3. In that config set `"hwaccel": "vaapi"` so the Intel GPU decodes the H.264, and
@@ -106,7 +107,9 @@ container (e.g. `scp` to `/root/rtmp-multiview/`), then:
 ```bash
 cd /root/rtmp-multiview
 chmod +x install.sh
-./install.sh --ndi     # NDI output (downloads the NDI 6 runtime)
+./install.sh --omt     # OMT output (default; builds libomt from source, a few minutes)
+# or
+./install.sh --ndi     # NDI output (downloads the NDI 6 runtime), then set "type": "ndi"
 ```
 
 Open `http://<container-ip>:8080/`, enter the titles and URLs, press **Save & apply**.
@@ -132,11 +135,27 @@ publishing and playing. Treat these URLs like passwords: whoever has one can als
 that channel. HLS (`https://…/playlist.m3u8`), SRT (`srt://host:port?streamid=…`), RTSP and
 UDP URLs work too.
 
+### Input buffer (`input_buffer_ms`, default 1000)
+
+Each feed has a jitter buffer. Incoming frames are held for this long and then played out at
+the source's own frame rate. RTMP over the internet often arrives in bursts, and without a
+buffer the tile would stutter. With it, motion is smooth. The price is that the multiview
+runs this much behind the live feed. The audio meters are delayed by the same amount, so they
+stay in sync with the picture. For RTMP inputs the same value is also sent to the server as
+the client buffer length.
+
+- `0` shows each frame the moment it arrives (lowest latency, may stutter)
+- raise it (e.g. `2000`) on a bad link where the web UI shows "underruns"
+- per input: add `"buffer_ms": 500` to that input's entry in `inputs`
+
+The web UI shows each live feed's buffer fill (e.g. `buffer 1.0/1.0s`) and any underruns.
+Memory: 1 s of buffer is about 45 MB per live 1080p50 feed.
+
 ## 4. Ways to run it
 
 | where | how | what you get |
 |-------|-----|--------------|
-| Headless Linux (LXC, server) | `./install.sh --ndi` (systemd service) | no window; NDI/OMT to the network + web UI |
+| Headless Linux (LXC, server) | `./install.sh --omt` (systemd service) | no window; NDI/OMT to the network + web UI |
 | Linux with a desktop | `./install.sh --desktop` → "RTMP Multiview" in the app menu, or `rtmp-multiview-gui` | fullscreen window (also sends NDI/OMT unless `output.enabled` is false) |
 | Windows | double-click `rtmp-multiview.exe` | window + NDI/OMT + web UI |
 
@@ -168,8 +187,8 @@ composes enough frames for the window or the web preview.
 
 | type         | what it does |
 |--------------|--------------|
-| `ndi`        | NDI source named `output.name`, sent from inside the program (needs `install.sh --ndi`, or the NDI Runtime/Tools on Windows) |
-| `omt`        | OMT source sent from inside the program via `libomt` (needs `install.sh --omt`) |
+| `omt`        | **default.** OMT source named `output.name`, sent from inside the program via `libomt` (needs `install.sh --omt`, or `libomt.dll` on Windows) |
+| `ndi`        | NDI source, sent from inside the program (needs `install.sh --ndi`, or the NDI Runtime/Tools on Windows) |
 | `ndi-gst`    | old method: pipe into `gst-launch-1.0 … ndisink` (gst-plugins-rs, not installed by default) |
 | `omt-ffmpeg` | pipe into an OMT-patched ffmpeg (`-f libomt`, path in `output.omt_ffmpeg`) |
 | `custom`     | pipe raw UYVY frames into any command in `output.command` |
@@ -208,15 +227,15 @@ window. The console window next to it shows the log, and closing either one stop
 
 1. Put `rtmp-multiview.exe` in a folder with `ffmpeg.exe` and `ffplay.exe` (e.g. from the
    gyan.dev "essentials" build), or have both on PATH.
-2. For NDI output, install **NDI Tools** or the **NDI 6 Runtime**. The exe finds the runtime
-   through `NDI_RUNTIME_DIR_V6`, which their installers set.
+2. For the default OMT output, put `libomt.dll` + `libvmx.dll` (from the
+   openmediatransport/libomtnet releases) next to the exe. For NDI instead, install **NDI
+   Tools** or the **NDI 6 Runtime** and set `"type": "ndi"`; the exe finds the runtime through
+   `NDI_RUNTIME_DIR_V6`. Without either, the window and web UI still work, and the web UI shows
+   the output as not running.
 3. Double-click the exe. On first start it creates `config.json` next to itself and serves
    the web UI on `http://localhost:8080/`. Allow it through the Windows firewall when asked,
    so other machines can see the NDI source and the web page.
 4. Closing the console window stops it.
-
-For OMT on Windows, put `libomt.dll` + `libvmx.dll` (from the libomtnet releases) next to the
-exe and set `"type": "omt"`.
 
 ## Tuning
 

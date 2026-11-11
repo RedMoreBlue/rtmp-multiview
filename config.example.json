@@ -1,7 +1,7 @@
 {
   "output": {
     "enabled": true,
-    "type": "ndi",
+    "type": "omt",
     "name": "RTMP Multiview",
     "width": 1920,
     "height": 1080,
@@ -24,6 +24,7 @@
   "clock": true,
   "clock_caption": "TALLINN LOCAL TIME",
   "audio_meters": true,
+  "input_buffer_ms": 1000,
   "inputs": [
     { "name": "Korv 1", "url": "rtmp://SERVER/APP/STREAMKEY1" },
     { "name": "Korv 2", "url": "rtmp://SERVER/APP/STREAMKEY2" },

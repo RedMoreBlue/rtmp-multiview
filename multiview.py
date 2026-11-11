@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
         # custom     - pipe raw UYVY into output.command
         # null       - no network output (web preview only)
         "enabled": True,               # false = don't send anything to the network
-        "type": "ndi",
+        "type": "omt",
         "name": "RTMP Multiview",      # NDI / OMT source name
         "width": 1920,
         "height": 1080,
@@ -93,6 +93,10 @@ DEFAULT_CONFIG = {
     "clock": True,
     "clock_caption": "",               # text under the clock, e.g. "TALLINN LOCAL TIME"
     "audio_meters": True,
+    # Jitter buffer per input: frames are held this long and played out at the source's own
+    # frame rate, so bursty RTMP delivery looks smooth. Adds this much delay. 0 = show frames
+    # as soon as they arrive (lowest latency). Per input: "buffer_ms" in that input's entry.
+    "input_buffer_ms": 1000,
     "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "inputs": [
         {"name": "Channel 1", "url": ""},
@@ -267,7 +271,18 @@ class Input:
         self.url = (cfg.get("url") or "").strip()
         self.args = list(cfg.get("args") or [])
         self.state = STATE_UNSET if not self.url else STATE_CONNECTING
-        self.frame = None            # latest UYVY tile (np array)
+        self.cfg_in = cfg
+        self.frame = None            # UYVY tile currently shown (np array)
+        self.q = deque()             # jitter buffer of received tiles
+        self.src_fps = 0.0           # nominal source frame rate from the stream info
+        self._prebuffering = True
+        self._acc = 0.5
+        self._depth = 0.0            # smoothed buffer depth (frames)
+        self._arr = deque(maxlen=400) # arrival times, for the real frame rate
+        self._pb_t = None            # arrival time of the first frame while (re)buffering
+        self.delay_s = 0.0           # current buffer depth in seconds
+        self.underruns = 0
+        self._lv = deque(maxlen=600) # (time, channel, dBFS) for delayed audio meters
         self.last_frame_t = 0.0
         self.started_t = 0.0
         self.live_since = 0.0
@@ -304,7 +319,7 @@ class Input:
         if url != self.url:
             log.info("[%d] URL changed", self.idx + 1)
             self.url = url
-            self.frame = None
+            self._reset_buffer()
             self.failed = False
             self.standby = False
             self.down_since = 0.0
@@ -318,11 +333,109 @@ class Input:
         self._kill()
         self.wake.set()
 
+    def buffer_s(self):
+        v = self.cfg_in.get("buffer_ms", self.app.cfg.get("input_buffer_ms", 1000))
+        try:
+            return max(0.0, min(10.0, float(v or 0) / 1000.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _reset_buffer(self):
+        self.q.clear()
+        self.frame = None
+        self._prebuffering = True
+        self._acc = 0.5
+        self._depth = 0.0
+        self._arr.clear()
+        self._pb_t = None
+        self.delay_s = 0.0
+        self._lv.clear()
+
+    def _push(self, tile, t):
+        """A decoded tile arrived from ffmpeg at time t."""
+        self._arr.append(t)
+        if self._prebuffering and self._pb_t is None:
+            self._pb_t = t
+        if self.buffer_s() > 0:
+            self.q.append(tile)
+            if len(self.q) > 600:               # safety cap (~12 s at 50 fps)
+                self.q.popleft()
+        else:
+            self.frame = tile
+
+    def play_fps(self):
+        """Rate to play the buffer out at: the stream's nominal fps, unless the frames really
+        arrive at a clearly different rate (measured over the last ~5 s)."""
+        nominal = self.src_fps
+        a = self._arr
+        est = 0.0
+        if len(a) >= 10:
+            i = 0
+            while a[-1] - a[i] > 5.0 and i < len(a) - 10:
+                i += 1
+            span = a[-1] - a[i]
+            if span >= 1.0:
+                est = (len(a) - 1 - i) / span
+        if nominal and (not est or abs(est - nominal) / nominal < 0.1):
+            return nominal
+        return est or nominal or 25.0
+
+    def playout(self, dt):
+        """Called by the compositor every output frame: returns the tile to show now.
+
+        Frames leave the buffer at the source frame rate, nudged by up to +-5% to keep the
+        buffer near its target depth (absorbs clock drift without visible jumps). If the
+        buffer runs dry the last picture is held until it has refilled."""
+        b = self.buffer_s()
+        if b <= 0:
+            self.delay_s = 0.0
+            return self.frame
+        fps = self.play_fps()
+        target = max(1, int(round(b * fps)))
+        q = self.q
+        if self._prebuffering:
+            # Start only after the buffer time has really passed since the first frame came
+            # in: right after connecting ffmpeg delivers a backlog burst, which fills the
+            # queue instantly but gives no real cushion. Then drop that backlog so the delay
+            # is exactly the configured one.
+            need = target
+            waited = (self._arr[-1] - self._pb_t) if (self._arr and self._pb_t is not None) else 0.0
+            if len(q) < need or waited < need / fps:
+                return self.frame
+            while len(q) > need:
+                q.popleft()
+            self._prebuffering, self._acc, self._depth = False, 0.5, float(len(q))
+        if len(q) > 2 * target + 2:                 # far behind (e.g. a big burst): catch up
+            while len(q) > target:
+                q.popleft()
+            self._depth = float(len(q))
+        # Speed correction from the depth averaged over ~3 s, so the sawtooth of bursty
+        # delivery doesn't wobble the rate (which would show as freeze+skip pairs).
+        self._depth += (len(q) - self._depth) * min(1.0, dt / 3.0)
+        adj = max(-0.05, min(0.05, 0.05 * (self._depth - target) / target))
+        self._acc += dt * fps * (1.0 + adj)
+        n = int(self._acc)
+        self._acc -= n
+        for _ in range(n):
+            if not q:
+                self._prebuffering = True
+                self._pb_t = None
+                self.underruns += 1
+                break
+            self.frame = q.popleft()
+        self.delay_s = len(q) / fps
+        return self.frame
+
     def levels(self):
-        """Current peak dBFS per channel; -inf when silent/stale."""
-        if time.monotonic() - self.audio_t > 0.6:
-            return [-math.inf, -math.inf]
-        return list(self.peak)
+        """Peak dBFS per channel matching the picture currently shown; -inf when silent/stale."""
+        t = time.monotonic() - self.delay_s
+        found = [None, None]                    # (timestamp, dB) per channel
+        for ts, ch, v in reversed(self._lv):
+            if ts <= t and found[ch] is None:
+                found[ch] = (ts, v)
+                if found[0] and found[1]:
+                    break
+        return [f[1] if f and t - f[0] < 0.6 else -math.inf for f in found]
 
     def status(self):
         now = time.monotonic()
@@ -337,6 +450,9 @@ class Input:
             "has_audio": self.has_audio,
             "levels": [round(x, 1) if x > -100 else None for x in lv],
             "fps": round(self.measured_fps, 1),
+            "buffer_ms": int(self.buffer_s() * 1000),
+            "buffered_ms": int(self.delay_s * 1000),
+            "underruns": self.underruns,
             "live_for": int(now - self.live_since) if self.state == STATE_LIVE else 0,
             "down_for": int(now - self.down_since)
             if self.state in (STATE_OFFLINE, STATE_STANDBY) and self.down_since else 0,
@@ -365,6 +481,8 @@ class Input:
                 "-fflags", "+discardcorrupt"]
                + (["-filter_threads", "1", "-threads", str(th)] if th > 0 else [])
                + (["-hwaccel", hw] if hw else [])
+               + (["-rtmp_buffer", str(int(self.buffer_s() * 1000))]
+                  if self.url.lower().startswith("rtmp") and self.buffer_s() > 0 else [])
                + list(cfg.get("input_args") or []) + self.args
                + ["-i", self.url,
                   # output 1: scaled video as raw UYVY on stdout
@@ -396,6 +514,7 @@ class Input:
                 ch = int(m.group(1)) - 1
                 self.peak[ch] = v
                 self.audio_t = time.monotonic()
+                self._lv.append((self.audio_t, ch, v))
                 continue
             if "Parsed_ametadata" in line:      # "frame:N pts:..." headers
                 continue
@@ -407,6 +526,8 @@ class Input:
                 m = VIDEO_RE.search(line)
                 if m:
                     fps = FPS_RE.search(line)
+                    if fps and 1.0 <= float(fps.group(1)) <= 120.0:
+                        self.src_fps = float(fps.group(1))
                     self.info = f"{m.group(1)} {m.group(2)}x{m.group(3)}" + (
                         f"@{float(fps.group(1)):g}" if fps else "")
                     if self.has_audio is None:
@@ -470,6 +591,8 @@ class Input:
             self.state = (STATE_STANDBY if self.standby else
                           STATE_OFFLINE if self.failed else STATE_CONNECTING)
             self.info, self.audio_info, self.has_audio = "", "", None
+            self.src_fps = 0.0
+            self._reset_buffer()
             self.peak = [-math.inf, -math.inf]
             self._lines.clear()
             self._kill_reason = None
@@ -494,8 +617,8 @@ class Input:
                 buf = proc.stdout.read(size)
                 if not buf or len(buf) < size:
                     break
-                self.frame = np.frombuffer(buf, np.uint8).reshape(shape)
                 self.last_frame_t = time.monotonic()
+                self._push(np.frombuffer(buf, np.uint8).reshape(shape), self.last_frame_t)
                 self._got_frame = True
                 self._count += 1
                 if self.state != STATE_LIVE:
@@ -528,7 +651,7 @@ class Input:
         if was_live or not self.failed or not self.down_since:
             self.down_since = now
         self.failed = True
-        self.frame = None
+        self._reset_buffer()
         cfg = self.app.cfg
         after = float(cfg.get("standby_after") or 0)
         if not self.standby and after > 0 and now - self.down_since >= after:
@@ -1293,7 +1416,9 @@ class App:
         for i, inp in enumerate(self.inputs):
             vx, vy = L.video_pos[i]
             state = inp.state
-            tile = inp.frame if state == STATE_LIVE else None
+            tile = inp.playout(dt) if state == STATE_LIVE else None
+            if state == STATE_LIVE and tile is None:
+                state = STATE_CONNECTING            # stream is in, buffer still filling
             if tile is not None:
                 blit(fr, tile, vx, vy)
                 if meters:
@@ -1313,7 +1438,8 @@ class App:
                     sub = (f"idle {fmt_dur(now - inp.down_since)}  ·  checking every "
                            f"{max(5.0, float(self.cfg.get('standby_retry') or 60)):g}s")
                 elif state == STATE_CONNECTING:
-                    detail, sub = "Waiting for stream…", ""
+                    detail = "Buffering…" if inp.state == STATE_LIVE else "Waiting for stream…"
+                    sub = ""
                 else:
                     detail, sub = "Enter a stream URL in the web UI", ""
                 blit(fr, R.slate(state, detail), vx, vy)
@@ -1480,7 +1606,7 @@ async function poll(){
   const p=document.getElementById('p'+k);p.className='pill '+i.state;
   p.textContent={live:'LIVE',offline:'NO SIGNAL',connecting:'CONNECTING',unset:'NOT SET',standby:'STANDBY'}[i.state];
   let m='';
-  if(i.state=='live')m=`${i.info}${i.audio?' · '+i.audio:''} · ${i.fps} fps · live ${dur(i.live_for)}`;
+  if(i.state=='live')m=`${i.info}${i.audio?' · '+i.audio:''} · ${i.fps} fps · live ${dur(i.live_for)}${i.buffer_ms?` · buffer ${(i.buffered_ms/1000).toFixed(1)}/${(i.buffer_ms/1000).toFixed(1)}s`:''}${i.underruns?` · ${i.underruns} underruns`:''}`;
   else if(i.state=='offline')m=`${i.error||'No signal'}${i.down_for?' · down '+dur(i.down_for):''} · retrying`;
   else if(i.state=='standby')m=`No stream for ${dur(i.down_for)} · checking every ${s.standby_retry}s, lights up by itself`;
   else if(i.state=='connecting')m='Connecting…';
