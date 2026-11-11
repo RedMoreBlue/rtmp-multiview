@@ -1,0 +1,33 @@
+{
+  "output": {
+    "enabled": true,
+    "type": "ndi",
+    "name": "RTMP Multiview",
+    "width": 1920,
+    "height": 1080,
+    "fps": 50,
+    "omt_quality": "default"
+  },
+  "display": { "enabled": "auto", "fullscreen": false, "width": 1280, "height": 720 },
+  "web": { "bind": "0.0.0.0", "port": 8080, "password": "" },
+  "input_args": [],
+  "connect_timeout": 15,
+  "stall_timeout": 4,
+  "reconnect_delay": 10,
+  "reconnect_delay_after_drop": 2,
+  "idle_fps": 10,
+  "standby_after": 900,
+  "standby_retry": 60,
+  "standby_fps": 5,
+  "hwaccel": "",
+  "decoder_threads": 2,
+  "clock": true,
+  "clock_caption": "TALLINN LOCAL TIME",
+  "audio_meters": true,
+  "inputs": [
+    { "name": "Korv 1", "url": "rtmp://SERVER/APP/STREAMKEY1" },
+    { "name": "Korv 2", "url": "rtmp://SERVER/APP/STREAMKEY2" },
+    { "name": "Korv 3", "url": "" },
+    { "name": "Korv 4", "url": "" }
+  ]
+}

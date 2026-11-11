@@ -1,0 +1,21 @@
+[Unit]
+Description=RTMP Multiview (2x2 grid to NDI/OMT)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=multiview
+Group=multiview
+ExecStart=/usr/bin/python3 /opt/rtmp-multiview/multiview.py /etc/rtmp-multiview/config.json
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+# NDI runtime location (installed by install.sh --ndi)
+Environment=NDI_RUNTIME_DIR_V6=/usr/local/lib
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
