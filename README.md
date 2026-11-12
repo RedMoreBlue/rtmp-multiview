@@ -3,8 +3,10 @@
 > This project was written with an AI coding assistant (Claude) and tested by a human on
 > real playout workflows. Review it like any other code before relying on it.
 
-Pulls up to 4 RTMP (or HLS/SRT) feeds, builds a labelled 2×2 grid at 1920×1080 / 50 fps and
-sends it to the network as **NDI** or **OMT**. Each tile shows:
+Pulls up to 4 RTMP (or HLS/SRT) feeds, builds a labelled 2×2 grid at 1920×1080 and shows it
+**live in any web browser**: a TV or monitor in fullscreen, a laptop, or a phone, on the LAN or
+over the internet with a password. Optionally it also sends the grid to the network as **NDI**
+or **OMT**, or shows it in a local window. Each tile shows:
 
 - the channel title (editable live in the web UI)
 - a tally: **LIVE** (green) / **NO SIGNAL** (red) / **CONNECTING** (amber) / **STANDBY**
@@ -40,9 +42,114 @@ A "check" is one short ffmpeg connection attempt to the stream URL, which costs 
 nothing. With `"output": {"enabled": false}` and no window, it composes only for the web
 preview and uses about 2%. Set `standby_after` to `0` to never go to standby.
 
-The web page on port 8080 shows a live preview (about 4 fps) and the status of each feed with
-audio bars. You can change the 4 titles, the URLs and the clock text there. Only a tile whose
-URL changed reconnects, and the output never drops.
+## Web multiviewer
+
+Open `http://<host>:8080/` and log in. The page is just the live multiview, scaled to the
+window. Press **F** or the fullscreen button (or double-click) and the screen becomes a
+multiviewer. A small toolbar in the corner fades out after 3 seconds and comes back when you
+move the mouse or tap:
+
+- the dot shows the connection (red banner + automatic reconnect if it drops)
+- **Auto / HD / SD / Mobile** picks the stream quality (Auto chooses by screen size)
+- fullscreen
+- **⚙ settings**: channel titles, stream URLs (keys hidden until you press *Show*), the text
+  under the clock, sign out. Only a tile whose URL changed reconnects.
+
+**On a phone in portrait** you get the picture on top and a readable list under it: tally,
+name, codec/resolution/fps and audio bars per channel. Turn the phone sideways for the full
+picture. On iPhone use *Share → Add to Home Screen* for a fullscreen app-like view (iOS
+doesn't allow the fullscreen button for web pages). The page keeps the screen awake while it's
+open.
+
+The picture is sent as an MJPEG stream (a series of JPEGs). It works in every browser, phones
+included, with well under a second of delay. An encoder only runs while somebody watches that
+quality, and it is shared by all viewers of that quality.
+
+| quality | picture | measured bandwidth (1 live feed) | server CPU while watched |
+|---------|---------|----------------------------------|--------------------------|
+| HD | 1920×1080 @ 25 fps | ~15 Mbit/s | ~0.5 core |
+| SD | 1280×720 @ 15 fps | ~5 Mbit/s | ~0.15 core |
+| Mobile | 960×540 @ 10 fps | ~1–2 Mbit/s | ~0.06 core |
+
+Use HD on the LAN and Mobile over mobile data. The profiles can be changed in
+`web.stream_profiles` (`[width, height, fps, jpeg quality 2..31]`). With nobody watching and
+NDI/OMT off, the server only composes 2 frames a second.
+
+## Security and internet access
+
+The web UI is designed to be safe to open to the internet **behind HTTPS**:
+
+- **Login page with sessions.** The browser gets a random session cookie (HttpOnly,
+  SameSite=Strict, Secure on HTTPS). You stay logged in for `session_hours` (default 7 days,
+  extended on use). *Sign out* ends the session immediately, also for an open live stream.
+- **Two roles (optional).** With only `password` set, everyone who logs in can watch and
+  change settings. Also set `admin_password`, and plain logins can only watch. Opening the
+  settings then asks for the admin password, which stays unlocked for `admin_minutes`
+  (default 30). Give techs the viewing password and keep the admin one for whoever manages the
+  stream keys.
+- **Stream keys stay private.** Viewers never receive the URLs; only the settings panel (admin)
+  does. Error messages on the picture and in the logs show only the server part of a URL
+  (`rtmp://server/…`).
+- **Brute-force protection.** After 5 wrong passwords from one address the login locks for
+  30 s, doubling up to 15 min.
+- **Hashed passwords.** `python3 multiview.py --hash-password` (or
+  `docker run --rm -it ghcr.io/redmoreblue/rtmp-multiview --hash-password`) prints a hash to
+  put in `web.password` / `MV_PASSWORD` instead of the plain text.
+- Strict security headers (Content-Security-Policy, no framing, no referrer), CSRF protection
+  on all changes, request size and time limits, and a limit on simultaneous live streams
+  (`max_viewers`, default 20).
+
+**HTTPS is required for internet access**, because the password would otherwise travel in
+plain text. Either use the Docker setup with Caddy (automatic Let's Encrypt certificate, see
+below), put it behind your own reverse proxy (nginx/Traefik), or set `web.tls_cert` /
+`web.tls_key` to serve HTTPS directly. With a reverse proxy, list its address in
+`web.trusted_proxies` (or `MV_TRUSTED_PROXIES`) so login lockouts see the real client
+address, and turn off response buffering for `/stream.mjpg` (nginx: `proxy_buffering off;`,
+which the app also requests with `X-Accel-Buffering: no`).
+
+Without any password the UI is open to anyone who can reach the port. That's only acceptable
+on a trusted LAN, and the log warns about it. The Docker image refuses to start without one.
+
+| setting | env override | default |
+|---------|--------------|---------|
+| `web.password` | `MV_PASSWORD` | empty = no login |
+| `web.admin_password` | `MV_ADMIN_PASSWORD` | empty = same as password |
+| `web.session_hours` | | 168 |
+| `web.admin_minutes` | | 30 |
+| `web.trusted_proxies` | `MV_TRUSTED_PROXIES` (comma separated) | none |
+| `web.tls_cert`, `web.tls_key` | | empty (plain HTTP) |
+| `web.max_viewers` | | 20 |
+
+## Docker
+
+The image (`ghcr.io/redmoreblue/rtmp-multiview`) contains Python, ffmpeg and the app, runs as an
+unprivileged user and keeps `config.json` in the `/config` volume. NDI/OMT aren't included in
+the image; it's meant for the web multiviewer.
+
+```bash
+git clone https://github.com/RedMoreBlue/rtmp-multiview.git && cd rtmp-multiview
+cp .env.example .env            # set MV_PASSWORD (and MV_ADMIN_PASSWORD, MV_DOMAIN)
+mkdir -p config && sudo chown 10001:10001 config
+docker compose up -d                       # LAN only: http://<host>:8080
+docker compose --profile https up -d       # + Caddy: https://MV_DOMAIN with a real certificate
+```
+
+For the https profile, `MV_DOMAIN` must be a DNS name that points at the host, with ports 80
+and 443 reachable from the internet (Let's Encrypt checks them). Set `MV_HTTP_BIND=127.0.0.1`
+in `.env` so plain-HTTP port 8080 is only reachable through Caddy. Then open the channels in
+the web UI (⚙). The config is saved to `./config/config.json`.
+
+Without compose:
+
+```bash
+docker run -d --name multiview --restart unless-stopped -p 8080:8080 \
+  -e MV_PASSWORD='your passphrase' -v "$PWD/config:/config" ghcr.io/redmoreblue/rtmp-multiview
+```
+
+Every push builds the image on GitHub and runs `ci/smoke-test.sh` against it before
+publishing. The test sends a real RTMP stream through the container and checks the login,
+live status, MJPEG stream and the security checks. Release tags publish `:latest` and the
+version tag; `main` publishes `:main`.
 
 ## System requirements
 
@@ -68,7 +175,8 @@ busiest day you expect.
 Notes:
 - All of them need **wired gigabit Ethernet**. A 1080p50 NDI/OMT output is about
   130–170 Mbit/s.
-- Docker isn't packaged yet. On Proxmox, an LXC with the installer is the tested path.
+- Docker: see [Docker](#docker). Same CPU figures; budget 1 GB RAM.
+- Web viewers add a little CPU on the server (see [Web multiviewer](#web-multiviewer)).
 - Hardware decoding (`"hwaccel"`) mostly helps weak CPUs. On a modern CPU the scaling step
   costs as much as the decoding.
 
@@ -107,20 +215,22 @@ container (e.g. `scp` to `/root/rtmp-multiview/`), then:
 ```bash
 cd /root/rtmp-multiview
 chmod +x install.sh
-./install.sh --omt     # OMT output (default; builds libomt from source, a few minutes)
-# or
-./install.sh --ndi     # NDI output (downloads the NDI 6 runtime), then set "type": "ndi"
+./install.sh            # web multiviewer (no network output)
+# optional network output, then set "output": {"enabled": true, ...}:
+./install.sh --omt      # OMT (builds libomt from source, a few minutes)
+./install.sh --ndi      # NDI (downloads the NDI 6 runtime), and set "type": "ndi"
 ```
 
-Open `http://<container-ip>:8080/`, enter the titles and URLs, press **Save & apply**.
+Open `http://<container-ip>:8080/`, open ⚙ settings, enter the titles and URLs, press
+**Save & apply**.
 The config lives in `/etc/rtmp-multiview/config.json` with mode 600, because it holds the
 stream keys. Running the installer again updates the program and keeps your config.
 
 - Logs: `journalctl -u rtmp-multiview -f`
 - Restart: `systemctl restart rtmp-multiview` (only needed after editing the config file by hand)
 
-Optional: set `"web": {"password": "…"}` to require a password for the web page (any
-username). Anyone on the LAN who can open the page can see the stream keys.
+Set a password before anyone else can reach the page: `"web": {"password": "…"}` in the
+config (see [Security and internet access](#security-and-internet-access)).
 
 ## 3. Stream URLs
 
@@ -155,9 +265,10 @@ Memory: 1 s of buffer is about 45 MB per live 1080p50 feed.
 
 | where | how | what you get |
 |-------|-----|--------------|
-| Headless Linux (LXC, server) | `./install.sh --omt` (systemd service) | no window; NDI/OMT to the network + web UI |
-| Linux with a desktop | `./install.sh --desktop` → "RTMP Multiview" in the app menu, or `rtmp-multiview-gui` | fullscreen window (also sends NDI/OMT unless `output.enabled` is false) |
-| Windows | double-click `rtmp-multiview.exe` | window + NDI/OMT + web UI |
+| Docker (company server) | `docker compose up -d` | web multiviewer (+ HTTPS with the Caddy profile) |
+| Headless Linux (LXC, server) | `./install.sh` (systemd service; add `--omt`/`--ndi` for network output) | web multiviewer (+ NDI/OMT if enabled) |
+| Linux with a desktop | `./install.sh --desktop` → "RTMP Multiview" in the app menu, or `rtmp-multiview-gui` | fullscreen window + web UI |
+| Windows | double-click `rtmp-multiview.exe` | window + web UI (+ NDI/OMT if enabled) |
 
 The window uses **ffplay** (part of ffmpeg). Keys: `f` or a double-click toggles fullscreen,
 `q`/`Esc` quits, and closing the window stops the program. Command-line flags override the
@@ -180,14 +291,14 @@ machine should only run the window.
 
 ## 5. Network output (`output` in config.json)
 
-`"enabled": false` turns off NDI/OMT completely. Nothing is sent, and the program only
-composes enough frames for the window or the web preview.
+Off by default. Set `"enabled": true` to send the multiview as NDI or OMT as well. With it
+off, nothing is sent and the program only composes what the web viewers and the window need.
 
-`output.type`:
+`output.type` (when enabled):
 
 | type         | what it does |
 |--------------|--------------|
-| `omt`        | **default.** OMT source named `output.name`, sent from inside the program via `libomt` (needs `install.sh --omt`, or `libomt.dll` on Windows) |
+| `omt`        | **default type.** OMT source named `output.name`, sent from inside the program via `libomt` (needs `install.sh --omt`, or `libomt.dll` on Windows) |
 | `ndi`        | NDI source, sent from inside the program (needs `install.sh --ndi`, or the NDI Runtime/Tools on Windows) |
 | `ndi-gst`    | old method: pipe into `gst-launch-1.0 … ndisink` (gst-plugins-rs, not installed by default) |
 | `omt-ffmpeg` | pipe into an OMT-patched ffmpeg (`-f libomt`, path in `output.omt_ffmpeg`) |
@@ -234,7 +345,7 @@ window. The console window next to it shows the log, and closing either one stop
    the output as not running.
 3. Double-click the exe. On first start it creates `config.json` next to itself and serves
    the web UI on `http://localhost:8080/`. Allow it through the Windows firewall when asked,
-   so other machines can see the NDI source and the web page.
+   so other machines can open the web page (and see the NDI/OMT source if you enable it).
 4. Closing the console window stops it.
 
 ## Tuning

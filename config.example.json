@@ -1,6 +1,6 @@
 {
   "output": {
-    "enabled": true,
+    "enabled": false,
     "type": "omt",
     "name": "RTMP Multiview",
     "width": 1920,
@@ -8,8 +8,22 @@
     "fps": 50,
     "omt_quality": "default"
   },
-  "display": { "enabled": "auto", "fullscreen": false, "width": 1280, "height": 720 },
-  "web": { "bind": "0.0.0.0", "port": 8080, "password": "" },
+  "display": {
+    "enabled": "auto",
+    "fullscreen": false,
+    "width": 1280,
+    "height": 720
+  },
+  "web": {
+    "bind": "0.0.0.0",
+    "port": 8080,
+    "password": "",
+    "admin_password": "",
+    "session_hours": 168,
+    "admin_minutes": 30,
+    "trusted_proxies": [],
+    "max_viewers": 20
+  },
   "input_args": [],
   "connect_timeout": 15,
   "stall_timeout": 4,
@@ -26,9 +40,21 @@
   "audio_meters": true,
   "input_buffer_ms": 1000,
   "inputs": [
-    { "name": "Korv 1", "url": "rtmp://SERVER/APP/STREAMKEY1" },
-    { "name": "Korv 2", "url": "rtmp://SERVER/APP/STREAMKEY2" },
-    { "name": "Korv 3", "url": "" },
-    { "name": "Korv 4", "url": "" }
+    {
+      "name": "Korv 1",
+      "url": "rtmp://SERVER/APP/STREAMKEY1"
+    },
+    {
+      "name": "Korv 2",
+      "url": "rtmp://SERVER/APP/STREAMKEY2"
+    },
+    {
+      "name": "Korv 3",
+      "url": ""
+    },
+    {
+      "name": "Korv 4",
+      "url": ""
+    }
   ]
 }

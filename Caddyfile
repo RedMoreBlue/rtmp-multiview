@@ -1,0 +1,9 @@
+# HTTPS in front of the multiview (docker compose --profile https).
+# Caddy gets and renews a Let's Encrypt certificate for MV_DOMAIN automatically;
+# the domain must point at this host and ports 80/443 must be reachable.
+{$MV_DOMAIN} {
+	reverse_proxy multiview:8080 {
+		# pass every live-stream frame through immediately (no buffering)
+		flush_interval -1
+	}
+}

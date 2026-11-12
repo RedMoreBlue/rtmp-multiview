@@ -8,3 +8,7 @@ __pycache__/
 # real configs contain stream keys - never commit them
 config.json
 *.local.json
+
+# docker compose secrets and data
+.env
+config/

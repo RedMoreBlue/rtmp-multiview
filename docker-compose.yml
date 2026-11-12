@@ -1,0 +1,46 @@
+# RTMP Multiview (developed with AI)
+#
+#   cp .env.example .env        # set MV_PASSWORD (and MV_DOMAIN for HTTPS)
+#   mkdir -p config && sudo chown 10001:10001 config
+#   docker compose up -d                      # LAN: http://<host>:8080
+#   docker compose --profile https up -d      # + Caddy with automatic HTTPS on MV_DOMAIN
+#
+# For access from the internet use the https profile (or your own reverse proxy with TLS),
+# and don't expose port 8080 itself to the internet: it is plain HTTP.
+services:
+  multiview:
+    image: ghcr.io/redmoreblue/rtmp-multiview:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      MV_PASSWORD: ${MV_PASSWORD:?Set MV_PASSWORD in .env}
+      MV_ADMIN_PASSWORD: ${MV_ADMIN_PASSWORD:-}
+      # only X-Forwarded-* headers from the Caddy container are believed
+      MV_TRUSTED_PROXIES: caddy
+    volumes:
+      - ./config:/config
+    ports:
+      - "${MV_HTTP_BIND:-0.0.0.0}:8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on: [multiview]
+    environment:
+      MV_DOMAIN: ${MV_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

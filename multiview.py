@@ -18,14 +18,19 @@ Usage:  multiview.py [/path/to/config.json]
 import base64
 import ctypes
 import ctypes.util
+import hashlib
 import hmac
+import ipaddress
 import io
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -55,7 +60,7 @@ DEFAULT_CONFIG = {
         # omt-ffmpeg - OMT-patched ffmpeg with -f libomt
         # custom     - pipe raw UYVY into output.command
         # null       - no network output (web preview only)
-        "enabled": True,               # false = don't send anything to the network
+        "enabled": False,              # true = send the multiview to the network as NDI/OMT
         "type": "omt",
         "name": "RTMP Multiview",      # NDI / OMT source name
         "width": 1920,
@@ -72,7 +77,21 @@ DEFAULT_CONFIG = {
     # desktops (DISPLAY/WAYLAND_DISPLAY set), off when headless / under systemd.
     "display": {"enabled": "auto", "fullscreen": False, "width": 1280, "height": 720,
                 "exit_on_close": True},
-    "web": {"bind": "0.0.0.0", "port": 8080, "password": ""},
+    "web": {
+        "bind": "0.0.0.0", "port": 8080,
+        # Login. Plain text or a hash from `multiview.py --hash-password`. Env MV_PASSWORD /
+        # MV_ADMIN_PASSWORD override these. Empty password = no login (only for a trusted LAN).
+        "password": "",
+        "admin_password": "",          # optional: needed to open the settings (else same as password)
+        "session_hours": 168,          # stay logged in this long (sliding)
+        "admin_minutes": 30,           # settings access after entering the admin password
+        "trusted_proxies": [],         # reverse proxy IPs/hostnames whose X-Forwarded-* to trust
+        "tls_cert": "", "tls_key": "", # serve HTTPS directly (else use a reverse proxy)
+        "max_viewers": 20,             # simultaneous live streams
+        # live stream profiles: [width, height, fps, jpeg quality 2 (best) .. 31]
+        "stream_profiles": {"hd": [1920, 1080, 25, 5], "sd": [1280, 720, 15, 6],
+                            "mobile": [960, 540, 10, 7]},
+    },
     "ffmpeg": "ffmpeg",
     "ffplay": "ffplay",
     "input_args": [],                  # extra ffmpeg args before -i for every input (e.g. hwaccel)
@@ -249,6 +268,18 @@ REASONS = [
 ]
 ERROR_HINTS = ("error", "failed", "refused", "not found", "timed out", "invalid", "denied",
                "no such", "unauthorized", "unreachable", "reset", "end of file", "40")
+
+
+URL_PATH_RE = re.compile(r"((?:rtmps?|rtmpt|rtmpe|srt|https?|rtsps?|udp|rtp|tcp)://[^/\s?]+)[^\s'\"]*", re.I)
+
+
+def redact(text, url=""):
+    """Hide stream keys: drop everything after the host part of any URL in the text."""
+    if not text:
+        return text
+    if url:
+        text = text.replace(url, URL_PATH_RE.sub(r"\1/…", url))
+    return URL_PATH_RE.sub(r"\1/…", text)
 
 
 def classify(lines):
@@ -443,7 +474,7 @@ class Input:
         return {
             "index": self.idx + 1,
             "name": self.name,
-            "url": self.url,
+            "has_url": bool(self.url),
             "state": self.state,
             "info": self.info,
             "audio": self.audio_info if self.has_audio else ("no audio" if self.has_audio is False else ""),
@@ -640,7 +671,7 @@ class Input:
                 break
             if url != self.url:          # changed by the web UI; reconnect at once
                 continue
-            self.last_error = self._reason(was_live, rc)
+            self.last_error = redact(self._reason(was_live, rc), url)
             if was_live or not self.failed:
                 log.info("[%d] %s: %s", self.idx + 1, "signal lost" if was_live else "no signal",
                          self.last_error)
@@ -1297,6 +1328,14 @@ class App:
             self.display = Output(PipeSink(cmd), "display",
                                   on_close=self._display_closed if d.get("exit_on_close", True) else None)
         self.mode = ""
+        self.boot = secrets.token_hex(4)          # lets browsers notice a restart
+        self.previews = {}
+        for name, v in (self.cfg["web"].get("stream_profiles") or {}).items():
+            try:
+                w, h, fps, q = v
+                self.previews[name] = PreviewStream(self, name, int(w), int(h), float(fps), int(q))
+            except (TypeError, ValueError):
+                log.error("bad web.stream_profiles entry %r: %r", name, v)
         self.frame = np.zeros((self.layout.H, self.layout.W * 2), np.uint8)
         self.frame[:, 0::2] = 128   # U/V neutral
         self.frame[:, 1::2] = 16    # Y black
@@ -1462,18 +1501,21 @@ class App:
             c = R.center(time.strftime("%H:%M:%S") if show_clock else "", caption)
             blit(fr, c, even((L.W - box_w) // 2), L.band_y)
 
-    def _rate(self, sinks):
+    def _rate(self, sinks, previews=()):
         """Frame rate for this frame: full while anything is live, idle_fps when every feed is
-        empty, and just enough for the web preview when nothing is being sent anywhere."""
-        if not sinks:
-            return min(self.fps, 5.0), "preview only (no output)"
+        empty, standby_fps when all are in standby. With nobody watching or receiving it only
+        composes a few frames a second for snapshots. Web viewers alone need at most the
+        fastest stream profile's rate."""
+        if not sinks and not previews:
+            return min(self.fps, 2.0), "nobody watching"
+        cap = self.fps if sinks else min(self.fps, max(p.fps for p in previews))
         idle = float(self.cfg.get("idle_fps") or 0)
         if idle <= 0 or any(i.state == STATE_LIVE for i in self.inputs):
-            return self.fps, "live"
+            return cap, "live"
         sb = float(self.cfg.get("standby_fps") or 0)
         if sb > 0 and all(i.state in (STATE_STANDBY, STATE_UNSET) for i in self.inputs):
-            return min(self.fps, idle, sb), "standby (power saving)"
-        return min(self.fps, idle), "idle (no live feeds)"
+            return min(cap, idle, sb), "standby (power saving)"
+        return min(cap, idle), "idle (no live feeds)"
 
     def run(self):
         for inp in self.inputs:
@@ -1485,16 +1527,21 @@ class App:
         while not self.stopping.is_set():
             t0 = time.monotonic()
             sinks = [s for s in (self.output, self.display) if s and s.active]
-            rate, self.mode = self._rate(sinks)
+            previews = [p for p in self.previews.values() if p.active]
+            rate, self.mode = self._rate(sinks, previews)
             period = 1.0 / rate
             try:
                 self.compose()
             except Exception:
                 log.exception("compose failed")
-            if sinks:
+            if sinks or previews:
                 f = self.frame.copy()            # one copy, shared read-only by all outputs
                 for s in sinks:
                     s.write(f)
+                for p in previews:
+                    p.submit(f, t0)
+            for p in self.previews.values():
+                p.maintain(t0)
             dt = (time.monotonic() - t0) * 1000
             self.stats["render_ms"] = self.stats["render_ms"] * 0.98 + dt * 0.02
             self.stats["frames"] += 1
@@ -1512,6 +1559,8 @@ class App:
         self.output.stop()
         if self.display:
             self.display.stop()
+        for p in self.previews.values():
+            p.stop()
 
     def snapshot_jpeg(self, quality=75, max_age=0.2):
         """Preview JPEG, shared between all viewers and regenerated at most 5x per second."""
@@ -1526,15 +1575,30 @@ class App:
             self._snap = (now, buf.getvalue())
             return self._snap[1]
 
+    def config_view(self, auth):
+        """Settings for the admin panel - the only place stream URLs (keys) are sent out."""
+        o = self.cfg["output"]
+        return {
+            "inputs": [{"index": i.idx + 1, "name": i.name, "url": i.url, "state": i.state}
+                       for i in self.inputs],
+            "caption": self.cfg.get("clock_caption") or "",
+            "open": auth.open, "separate_admin": bool(auth.admin_pw),
+            "output": {"enabled": bool(o.get("enabled")), "type": o.get("type"), "name": o.get("name")},
+        }
+
     def status(self):
         o, d = self.output, self.display
-        rate, _ = self._rate([s for s in (o, d) if s and s.active])
+        rate, _ = self._rate([s for s in (o, d) if s and s.active],
+                             [p for p in self.previews.values() if p.active])
         return {
             "mode": self.mode, "rate": rate,
+            "viewers": sum(p.viewers for p in self.previews.values()),
+            "boot": self.boot,
             "display": {"enabled": d is not None, "running": bool(d and d.active and d.ok),
                         "error": d.error if d else ""},
             "output": {"type": o.type, "name": self.cfg["output"]["name"],
                        "size": f"{self.layout.W}x{self.layout.H}", "fps": self.fps,
+                       "enabled": o.sink is not None,
                        "running": o.ok, "error": o.error, "connections": o.conns,
                        "sent": o.sent, "dropped": o.dropped,
                        "render_ms": round(self.stats["render_ms"], 2),
@@ -1547,161 +1611,803 @@ class App:
 
 
 # ----------------------------------------------------------------------------
-# Web UI
+# Live stream for the web UI (MJPEG, encoded only while somebody watches)
 # ----------------------------------------------------------------------------
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RTMP Multiview</title><style>
-:root{--bg:#0f1012;--card:#1a1b1f;--line:#2b2d33;--fg:#e8e8ea;--mut:#9a9ca3;
---live:#1f9d55;--off:#c0292b;--con:#d68910;--unset:#5a5a5a}
-*{box-sizing:border-box}body{margin:0 auto;background:var(--bg);color:var(--fg);
-font:14px/1.4 system-ui,sans-serif;padding:16px;max-width:1100px}
-h1{font-size:18px;margin:0 0 4px}#out{color:var(--mut);margin-bottom:12px;font-size:13px}
-#out b.bad{color:#ff6b6b}
-img{width:100%;border-radius:6px;background:#000;display:block;aspect-ratio:16/9}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}
-@media(max-width:700px){.grid{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
-.hd{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.pill{font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;color:#fff}
-.live{background:var(--live)}.offline{background:var(--off)}.connecting{background:var(--con)}.unset{background:var(--unset)}.standby{background:#345680}
-.meta{color:var(--mut);font-size:12px;min-height:17px;word-break:break-word}
-.mt{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11px;color:var(--mut)}
-.bar{flex:1;height:8px;background:#26282d;border-radius:2px;overflow:hidden}
-.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#28c85a 0 70%,#f0be28 70% 90%,#eb322d 90%)}
-.db{width:56px;text-align:right;font-variant-numeric:tabular-nums}
-label{display:block;font-size:12px;color:var(--mut);margin-top:8px}
-input{width:100%;padding:8px;border-radius:5px;border:1px solid var(--line);
-background:#111215;color:var(--fg);font:13px ui-monospace,monospace}
-button{margin-top:14px;padding:10px 18px;border:0;border-radius:6px;background:#3b6ef5;
-color:#fff;font-weight:600;cursor:pointer}#msg{margin-left:10px;color:var(--mut)}
+class PreviewStream:
+    """Turns the composited frames into an MJPEG stream for browsers.
+
+    One ffmpeg process per quality profile. It starts when the first viewer connects and
+    stops a few seconds after the last one leaves, so it costs nothing while nobody watches.
+    Every viewer always gets the newest JPEG; a slow connection simply skips frames."""
+
+    IDLE_STOP_S = 10.0
+
+    def __init__(self, app, name, w, h, fps, q):
+        self.app, self.name = app, name
+        self.w, self.h = even(w), even(h)
+        self.fps = max(1.0, min(float(fps), 60.0))
+        self.q = max(2, min(int(q), 31))
+        self.viewers = 0
+        self.jpeg, self.seq = None, 0
+        self.cv = threading.Condition()       # a new JPEG is available
+        self.wcv = threading.Condition()      # a new raw frame for the encoder
+        self._pending = None
+        self.proc = None
+        self._last_submit = 0.0
+        self._idle_since = None
+
+    @property
+    def active(self):
+        return self.viewers > 0 and self.proc is not None
+
+    def acquire(self):
+        with self.cv:
+            self.viewers += 1
+            self._idle_since = None
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+
+    def release(self):
+        with self.cv:
+            self.viewers = max(0, self.viewers - 1)
+            if self.viewers == 0:
+                self._idle_since = time.monotonic()
+
+    def _start(self):
+        L = self.app.layout
+        vf = ("format=yuvj420p" if (self.w, self.h) == (L.W, L.H)
+              else f"scale={self.w}:{self.h}:flags=area,format=yuvj420p")
+        cmd = [self.app.cfg["ffmpeg"], "-hide_banner", "-loglevel", "error",
+               "-filter_threads", "1",
+               "-f", "rawvideo", "-pix_fmt", "uyvy422", "-s", f"{L.W}x{L.H}",
+               "-framerate", f"{self.fps:g}", "-i", "pipe:0",
+               "-vf", vf, "-c:v", "mjpeg", "-q:v", str(self.q), "-threads", "2",
+               "-f", "mjpeg", "pipe:1"]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError as e:
+            log.error("web stream '%s': cannot start ffmpeg: %s", self.name, e)
+            self.proc = None
+            return
+        log.info("web stream '%s' started (%dx%d @ %g fps)", self.name, self.w, self.h, self.fps)
+        self._last_submit = 0.0
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True,
+                         name=f"mjpeg-out-{self.name}").start()
+        threading.Thread(target=self._writer, args=(self.proc,), daemon=True,
+                         name=f"mjpeg-in-{self.name}").start()
+
+    def submit(self, frame, now):
+        """Called by the compositor with each new frame; keeps only what the profile's fps needs
+        (on average exactly fps, also when the compositor runs at a rate that isn't a multiple)."""
+        period = 1.0 / self.fps
+        if now + 0.002 < self._last_submit:
+            return
+        # next due time; resync if we fell more than a frame behind
+        self._last_submit = max(self._last_submit + period, now - period + 0.002)
+        with self.wcv:
+            self._pending = frame
+            self.wcv.notify()
+
+    def _writer(self, proc):
+        while proc.poll() is None:
+            with self.wcv:
+                if self._pending is None:
+                    self.wcv.wait(0.5)
+                f, self._pending = self._pending, None
+            if f is None:
+                continue
+            try:
+                proc.stdin.write(f.data)
+            except (BrokenPipeError, OSError, ValueError):
+                break
+
+    def _reader(self, proc):
+        # ffmpeg's mjpeg output is a plain concatenation of JPEG files: cut at SOI/EOI markers
+        # (0xFFD9 cannot occur inside the entropy-coded data, it is byte-stuffed there)
+        buf = bytearray()
+        while True:
+            try:
+                chunk = proc.stdout.read(262144)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                s = buf.find(b"\xff\xd8")
+                if s < 0:
+                    del buf[:-1]
+                    break
+                e = buf.find(b"\xff\xd9", s + 2)
+                if e < 0:
+                    if s:
+                        del buf[:s]
+                    break
+                jpg = bytes(buf[s:e + 2])
+                del buf[:e + 2]
+                with self.cv:
+                    self.jpeg = jpg
+                    self.seq += 1
+                    self.cv.notify_all()
+        with self.cv:
+            self.cv.notify_all()
+
+    def wait_next(self, last_seq, timeout=5.0):
+        with self.cv:
+            if self.seq == last_seq:
+                self.cv.wait(timeout)
+            return self.seq, self.jpeg
+
+    def maintain(self, now):
+        p = self.proc
+        if p is None:
+            return
+        if p.poll() is not None:                 # encoder died: restart if still watched
+            self.proc = None
+            if self.viewers:
+                log.warning("web stream '%s' encoder exited, restarting", self.name)
+                with self.cv:
+                    self._start()
+            return
+        if self.viewers == 0 and self._idle_since and now - self._idle_since > self.IDLE_STOP_S:
+            self.stop()
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p:
+            for f in (p.stdin.close, p.kill):
+                try:
+                    f()
+                except Exception:
+                    pass
+            log.info("web stream '%s' stopped (no viewers)", self.name)
+
+
+# ----------------------------------------------------------------------------
+# Web authentication
+# ----------------------------------------------------------------------------
+
+PBKDF2_ITERATIONS = 300_000
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(PBKDF2_ITERATIONS, base64.b64encode(salt).decode(),
+                                           base64.b64encode(dk).decode())
+
+
+def verify_password(password, stored):
+    if not stored or not isinstance(password, str):
+        return False
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, it, salt, dk = stored.split("$")
+            calc = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(it))
+            return hmac.compare_digest(calc, base64.b64decode(dk))
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(password.encode(), stored.encode())
+
+
+class Auth:
+    """Password login with server-side sessions (cookie holds a random token only).
+
+    Roles: with only `password` set, everyone who logs in may also change settings. With
+    `admin_password` set, the settings need that password, and admin rights expire after
+    admin_minutes of not using them. No password at all = open access (trusted LAN only)."""
+
+    COOKIE = "mv_session"
+
+    def __init__(self, wcfg):
+        self.view_pw = os.environ.get("MV_PASSWORD") or str(wcfg.get("password") or "")
+        self.admin_pw = os.environ.get("MV_ADMIN_PASSWORD") or str(wcfg.get("admin_password") or "")
+        self.open = not self.view_pw and not self.admin_pw
+        self.session_s = max(0.1, float(wcfg.get("session_hours") or 168)) * 3600
+        self.admin_s = max(1.0, float(wcfg.get("admin_minutes") or 30)) * 60
+        self.sessions = {}            # sha256(token) -> {"exp": t, "admin_until": t}
+        self.failures = {}            # ip -> (count, locked_until, first_failure)
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _key(token):
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def locked_for(self, ip):
+        with self.lock:
+            f = self.failures.get(ip)
+            return max(0.0, f[1] - time.monotonic()) if f else 0.0
+
+    def login(self, password, ip, old_token=None):
+        """-> (token, None) on success, (None, message) on failure."""
+        wait = self.locked_for(ip)
+        if wait > 0:
+            return None, f"Too many failed attempts. Try again in {int(wait) + 1} s."
+        is_admin = bool(self.admin_pw) and verify_password(password, self.admin_pw)
+        ok = is_admin or (bool(self.view_pw) and verify_password(password, self.view_pw))
+        now = time.monotonic()
+        if not ok:
+            with self.lock:
+                cnt, until, first = self.failures.get(ip, (0, 0.0, now))
+                if now - first > 900:
+                    cnt, first = 0, now
+                cnt += 1
+                if cnt >= 5:                       # 30 s, 60 s, 120 s ... up to 15 min
+                    until = now + min(900.0, 30.0 * 2 ** (cnt - 5))
+                if len(self.failures) > 10000:
+                    self.failures.clear()
+                self.failures[ip] = (cnt, until, first)
+            log.warning("web: failed login from %s", ip)
+            time.sleep(0.4)
+            return None, "Wrong password."
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            self.failures.pop(ip, None)
+            if old_token:
+                self.sessions.pop(self._key(old_token), None)
+            if len(self.sessions) > 2000:
+                self.sessions = {k: v for k, v in self.sessions.items() if v["exp"] > now}
+            self.sessions[self._key(token)] = {"exp": now + self.session_s,
+                                               "admin_until": now + self.admin_s if is_admin else 0.0}
+        log.info("web: login from %s (%s)", ip, "admin" if is_admin or not self.admin_pw else "viewer")
+        return token, None
+
+    def session(self, token, touch=True):
+        if not token:
+            return None
+        now = time.monotonic()
+        with self.lock:
+            s = self.sessions.get(self._key(token))
+            if not s:
+                return None
+            if s["exp"] < now:
+                self.sessions.pop(self._key(token), None)
+                return None
+            if touch:
+                s["exp"] = now + self.session_s
+            return s
+
+    def is_admin(self, s, touch=False):
+        if self.open or not self.admin_pw:
+            return True
+        now = time.monotonic()
+        if s and s["admin_until"] > now:
+            if touch:
+                s["admin_until"] = now + self.admin_s
+            return True
+        return False
+
+    def logout(self, token):
+        if token:
+            with self.lock:
+                self.sessions.pop(self._key(token), None)
+
+
+class TrustedProxies:
+    """IPs / networks / hostnames of reverse proxies whose X-Forwarded-* headers we believe."""
+
+    def __init__(self, entries):
+        self.entries = [str(e).strip() for e in entries if str(e).strip()]
+        self.nets, self.t = [], 0.0
+
+    def trusted(self, ip):
+        if not self.entries:
+            return False
+        if time.monotonic() - self.t > 60:          # re-resolve hostnames once a minute
+            nets = []
+            for e in self.entries:
+                try:
+                    nets.append(ipaddress.ip_network(e, strict=False))
+                except ValueError:
+                    try:
+                        for info in socket.getaddrinfo(e, None):
+                            nets.append(ipaddress.ip_network(info[4][0]))
+                    except OSError:
+                        pass
+            self.nets, self.t = nets, time.monotonic()
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(a in n for n in self.nets)
+
+
+# ----------------------------------------------------------------------------
+# Web pages
+# ----------------------------------------------------------------------------
+
+LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000"><meta name="robots" content="noindex">
+<title>RTMP Multiview - sign in</title>
+<style nonce="{{N}}">
+:root{color-scheme:dark}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0c0e;color:#e8e8ea;font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+form{width:min(340px,90vw);background:#16171b;border:1px solid #2a2c32;border-radius:12px;padding:24px}
+h1{font-size:18px;margin:0 0 16px}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #33363d;background:#0e0f12;color:inherit;font-size:16px}
+button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:8px;background:#3b6ef5;color:#fff;font-weight:600;font-size:16px;cursor:pointer}
+#e{color:#ff6b6b;min-height:20px;margin-top:10px;font-size:14px}
 </style></head><body>
-<h1>RTMP Multiview</h1><div id="out">…</div>
-<img id="snap" src="snapshot.jpg" alt="preview">
-<form id="f"><div class="card" style="margin-top:14px"><label style="margin-top:0">Text under the clock (e.g. TALLINN LOCAL TIME, STILL FRAME TALLINN PLAYOUT; empty = clock only)</label>
-<input name="caption" id="caption" maxlength="80" placeholder="TALLINN LOCAL TIME"></div>
-<div class="grid" id="cards"></div>
-<button type="submit">Save &amp; apply</button><span id="msg"></span></form>
-<script>
-const cards=document.getElementById('cards');let built=false;
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+'h ':'')+(h||m?m+'m ':'')+x+'s'}
-const pct=db=>db===null?0:Math.max(0,Math.min(100,(db+60)/60*100));
-async function poll(){
- try{const r=await fetch('api/status');const s=await r.json();const o=s.output;
- const run=o.running?'running':`<b class="bad">NOT RUNNING${o.error?': '+esc(o.error):''}</b>`;
- const con=o.connections===null||o.connections===undefined?'':` · ${o.connections} receiver${o.connections==1?'':'s'}`;
- const net=(o.type=='off'||o.type=='null')?'Network output OFF':`${esc(o.type.toUpperCase())} "${esc(o.name)}" · ${run}${con}`;
- const disp=s.display.enabled?` · window ${s.display.running?'open':'<b class="bad">not running</b>'}`:'';
- document.getElementById('out').innerHTML=`${net}${disp} · ${o.size} · ${esc(s.mode)} → ${s.rate} fps · render ${o.render_ms} ms · dropped ${o.dropped}`;
- if(!built)document.getElementById('caption').value=s.caption||'';
- s.inputs.forEach((i,k)=>{
-  if(!built){cards.insertAdjacentHTML('beforeend',`<div class="card"><div class="hd"><b>${i.index}</b>
-   <span class="pill" id="p${k}"></span></div><div class="meta" id="m${k}"></div>
-   <div class="mt">1<div class="bar"><i id="a${k}0"></i></div><span class="db" id="d${k}0"></span></div>
-   <div class="mt">2<div class="bar"><i id="a${k}1"></i></div><span class="db" id="d${k}1"></span></div>
-   <label>Title shown on the multiview</label><input name="name${k}" value="${esc(i.name)}" maxlength="60">
-   <label>Stream URL (rtmp://, https://…m3u8, srt://)</label><input name="url${k}" value="${esc(i.url)}" placeholder="rtmp://server/app/streamkey" autocomplete="off" spellcheck="false"></div>`)}
-  const p=document.getElementById('p'+k);p.className='pill '+i.state;
-  p.textContent={live:'LIVE',offline:'NO SIGNAL',connecting:'CONNECTING',unset:'NOT SET',standby:'STANDBY'}[i.state];
-  let m='';
-  if(i.state=='live')m=`${i.info}${i.audio?' · '+i.audio:''} · ${i.fps} fps · live ${dur(i.live_for)}${i.buffer_ms?` · buffer ${(i.buffered_ms/1000).toFixed(1)}/${(i.buffer_ms/1000).toFixed(1)}s`:''}${i.underruns?` · ${i.underruns} underruns`:''}`;
-  else if(i.state=='offline')m=`${i.error||'No signal'}${i.down_for?' · down '+dur(i.down_for):''} · retrying`;
-  else if(i.state=='standby')m=`No stream for ${dur(i.down_for)} · checking every ${s.standby_retry}s, lights up by itself`;
-  else if(i.state=='connecting')m='Connecting…';
-  document.getElementById('m'+k).textContent=m;
-  [0,1].forEach(c=>{const v=i.state=='live'&&i.has_audio?i.levels[c]:null;
-   document.getElementById(`a${k}${c}`).style.width=pct(v)+'%';
-   document.getElementById(`d${k}${c}`).textContent=i.state!='live'?'':(i.has_audio===false?'no audio':(v===null?'silent':v.toFixed(1)+' dB'));});
- });built=true;}catch(e){document.getElementById('out').textContent='Lost connection to the multiview service…'}
-}
-document.getElementById('f').onsubmit=async e=>{e.preventDefault();const fd=new FormData(e.target);
- const items=[0,1,2,3].map(k=>({name:fd.get('name'+k),url:fd.get('url'+k)}));
- const msg=document.getElementById('msg');
- const body={inputs:items,caption:fd.get('caption')||''};
- try{const r=await fetch('api/inputs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- const j=await r.json();msg.textContent=r.ok?'Saved':('Error: '+(j.error||r.status));}catch(err){msg.textContent='Error: '+err}
- setTimeout(()=>msg.textContent='',4000)};
-const snap=document.getElementById('snap');let loading=false;
-snap.onload=snap.onerror=()=>{loading=false};
-setInterval(()=>{if(!loading&&!document.hidden){loading=true;snap.src='snapshot.jpg?'+Date.now()}},250);
-setInterval(poll,500);poll();
+<form id="f"><h1>RTMP Multiview</h1>
+<input id="p" type="password" autocomplete="current-password" placeholder="Password" autofocus required>
+<button>Sign in</button><div id="e"></div></form>
+<script nonce="{{N}}">
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const er=document.getElementById('e');er.textContent='';
+ try{const r=await fetch('api/login',{method:'POST',headers:{'Content-Type':'application/json','X-MV':'1'},
+   body:JSON.stringify({password:document.getElementById('p').value})});
+  if(r.ok){location.replace('./');return}
+  const j=await r.json().catch(()=>({}));er.textContent=j.error||('Error '+r.status)}
+ catch(x){er.textContent='Cannot reach the server'}};
 </script></body></html>"""
 
+VIEWER_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000"><meta name="robots" content="noindex">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Multiview">
+<link rel="manifest" href="manifest.webmanifest">
+<title>RTMP Multiview</title>
+<style nonce="{{N}}">
+:root{color-scheme:dark;--fg:#e8e8ea;--mut:#9a9ca3;--card:#16171b;--line:#2a2c32}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#000;color:var(--fg);font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{overflow:hidden}
+#stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
+#mv{max-width:100%;max-height:100%;display:block;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#list{display:none}
+#hud{position:fixed;right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));display:flex;gap:4px;align-items:center;
+ padding:5px;border-radius:12px;background:rgba(20,21,25,.8);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:opacity .4s;z-index:5}
+body.idle #hud{opacity:0;pointer-events:none}
+body.idle{cursor:none}
+.btn{height:38px;min-width:38px;padding:0 10px;border:0;border-radius:8px;background:transparent;color:var(--fg);font:inherit;font-size:13px;cursor:pointer;
+ display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.btn:hover{background:rgba(255,255,255,.1)}
+.btn svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+select.btn{background:rgba(255,255,255,.07);appearance:none;-webkit-appearance:none;padding:0 12px}
+#dot{width:9px;height:9px;border-radius:50%;background:#28c85a;margin:0 8px 0 6px;flex:none}
+#dot.bad{background:#eb322d}
+#banner{position:fixed;top:max(12px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);background:#c0292b;color:#fff;padding:8px 14px;
+ border-radius:8px;font-weight:600;display:none;z-index:6;white-space:nowrap}
+#banner.show{display:block}
+.pill{font-size:11px;font-weight:700;padding:3px 7px;border-radius:5px;color:#fff;white-space:nowrap}
+.live{background:#1f9d55}.offline{background:#c0292b}.connecting{background:#d68910}.unset{background:#5a5a5a}.standby{background:#345680}
+@media (orientation:portrait) and (max-width:900px){
+ body{overflow:auto}
+ #stage{position:relative;inset:auto;width:100%;aspect-ratio:16/9;padding-top:env(safe-area-inset-top)}
+ #mv{width:100%;max-height:none}
+ #list{display:block;padding:10px 12px calc(84px + env(safe-area-inset-bottom))}
+ #hud{left:50%;right:auto;transform:translateX(-50%)}
+}
+.row{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center;padding:12px;margin-bottom:8px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meta{grid-column:1/3;color:var(--mut);font-size:12.5px;word-break:break-word}
+.mt{grid-column:1/3;display:flex;gap:8px;align-items:center;font-size:11px;color:var(--mut)}
+.bar{flex:1;height:6px;position:relative;border-radius:3px;overflow:hidden;background:linear-gradient(90deg,#28c85a 0 70%,#f0be28 70% 90%,#eb322d 90%)}
+.bar i{position:absolute;top:0;right:0;bottom:0;width:100%;background:#26282d;transition:width .3s}
+.db{width:58px;text-align:right;font-variant-numeric:tabular-nums}
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:9}
+body.open #scrim{display:block}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:min(470px,100vw);background:#101115;border-left:1px solid var(--line);transform:translateX(102%);
+ transition:transform .25s ease;z-index:10;overflow-y:auto;padding:max(16px,env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom))}
+body.open #drawer{transform:none}
+.dh{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+h2{font-size:17px;margin:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px}
+.ch{display:flex;align-items:center;gap:8px;font-weight:600}
+label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px}
+.in{width:100%;padding:10px;border-radius:7px;border:1px solid #33363d;background:#0b0c0f;color:var(--fg);font:16px ui-monospace,Menlo,Consolas,monospace}
+.urlrow{display:flex;gap:6px}
+.urlrow .in{flex:1;min-width:0}
+.primary{background:#3b6ef5;color:#fff;font-weight:600;height:44px;padding:0 20px}
+.primary:hover{background:#4d7bf6}
+.note{color:var(--mut);font-size:12.5px}
+.err{color:#ff6b6b}
+.actions{display:flex;align-items:center;gap:12px;margin:4px 0 14px}
+[hidden]{display:none!important}
+</style></head><body>
+<div id="stage"><img id="mv" alt="Multiview"></div>
+<div id="list"></div>
+<div id="banner">Connection lost - reconnecting...</div>
+<div id="hud">
+ <span id="dot" title="Connection"></span>
+ <select id="q" class="btn" aria-label="Quality"><option value="auto">Auto</option><option value="hd">HD</option><option value="sd">SD</option><option value="mobile">Mobile</option></select>
+ <button class="btn" id="fs" aria-label="Fullscreen" title="Fullscreen (F)"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+ <button class="btn" id="gear" aria-label="Settings" title="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+</div>
+<div id="scrim"></div>
+<aside id="drawer" aria-label="Settings">
+ <div class="dh"><h2>Settings</h2><button class="btn" id="close" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+ <div id="adminbox" class="card" hidden>
+  <div>Enter the admin password to change channels.</div>
+  <label for="apw">Admin password</label><input id="apw" class="in" type="password" autocomplete="current-password">
+  <div class="actions"><button class="btn primary" id="alogin" type="button">Unlock</button><span id="aerr" class="note err"></span></div>
+ </div>
+ <form id="cfg" hidden autocomplete="off">
+  <div class="card"><label for="caption">Text under the clock</label><input id="caption" class="in" maxlength="80" placeholder="TALLINN LOCAL TIME"></div>
+  <div id="chans"></div>
+  <div class="actions"><button class="btn primary" type="submit">Save &amp; apply</button><span id="msg" class="note"></span></div>
+ </form>
+ <div class="card note" id="sysinfo"></div>
+ <div id="openwarn" class="card note err" hidden>No password is set: anyone who can reach this page can watch and change the stream keys. Set web.password (or MV_PASSWORD) before exposing it.</div>
+ <button class="btn" id="logout" type="button">Sign out</button>
+</aside>
+<script nonce="{{N}}">
+(()=>{
+const $=id=>document.getElementById(id), body=document.body;
+const LABEL={live:'LIVE',offline:'NO SIGNAL',connecting:'CONNECTING',unset:'NOT SET',standby:'STANDBY'};
+const store={get(k,d){try{return localStorage.getItem(k)||d}catch(e){return d}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+const portrait=()=>matchMedia('(orientation:portrait) and (max-width:900px)').matches;
+let q=store.get('mv.q','auto'); $('q').value=q;
+function autoProfile(){
+ const coarse=matchMedia('(pointer:coarse)').matches, dpr=window.devicePixelRatio||1;
+ if(coarse&&Math.min(screen.width,screen.height)<700) return 'mobile';
+ const w=Math.max(innerWidth,innerHeight)*dpr; return w>=1700?'hd':w>=1000?'sd':'mobile';
+}
+const profile=()=>q==='auto'?autoProfile():q;
+let src='';
+function startStream(force){
+ if(document.hidden) return;
+ const s='stream.mjpg?p='+profile();
+ if(!force&&s===src) return;
+ src=s; $('mv').src=s+'&t='+Date.now();
+}
+function stopStream(){src='';$('mv').src='data:,';}
+$('q').onchange=()=>{q=$('q').value;store.set('mv.q',q);startStream(true)};
+addEventListener('resize',()=>{if(q==='auto')startStream(false)});
 
-def make_handler(app):
-    password = str(app.cfg["web"].get("password") or "")
+// toolbar auto-hide (not on phones in portrait, not while settings are open)
+let idleT;
+function wake(){body.classList.remove('idle');clearTimeout(idleT);
+ idleT=setTimeout(()=>{if(!body.classList.contains('open')&&!portrait())body.classList.add('idle')},3000)}
+['mousemove','mousedown','touchstart','keydown'].forEach(e=>addEventListener(e,wake,{passive:true})); wake();
+
+// fullscreen
+const de=document.documentElement, fsReq=de.requestFullscreen||de.webkitRequestFullscreen;
+const fsEl=()=>document.fullscreenElement||document.webkitFullscreenElement;
+function toggleFs(){ if(fsEl()){(document.exitFullscreen||document.webkitExitFullscreen).call(document)} else if(fsReq){fsReq.call(de).catch(()=>{})} }
+if(!fsReq) $('fs').hidden=true;
+$('fs').onclick=toggleFs; $('stage').ondblclick=toggleFs;
+addEventListener('keydown',e=>{ if(e.target.tagName==='INPUT')return;
+ if(e.key==='f'||e.key==='F')toggleFs(); if(e.key==='Escape')closeDrawer(); });
+
+// keep the screen on while watching
+let lock=null;
+async function wakeLock(){try{if('wakeLock' in navigator&&!document.hidden)lock=await navigator.wakeLock.request('screen')}catch(e){}}
+document.addEventListener('visibilitychange',()=>{ if(document.hidden){stopStream()} else {startStream(true);wakeLock()} });
+
+// status list (phone portrait) + connection watchdog
+const rows={};
+function row(i){
+ let r=rows[i.index]; if(r) return r;
+ const el=document.createElement('div'); el.className='row';
+ el.innerHTML='<span class="pill"></span><span class="nm"></span><div class="meta"></div>'+
+  '<div class="mt">1<div class="bar"><i></i></div><span class="db"></span></div><div class="mt">2<div class="bar"><i></i></div><span class="db"></span></div>';
+ $('list').appendChild(el);
+ r=rows[i.index]={pill:el.querySelector('.pill'),nm:el.querySelector('.nm'),meta:el.querySelector('.meta'),
+  bars:el.querySelectorAll('.bar i'),dbs:el.querySelectorAll('.db')};
+ return r;
+}
+const dur=s=>{const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+'h ':'')+(h||m?m+'m ':'')+x+'s'};
+function render(s){
+ s.inputs.forEach(i=>{
+  const r=row(i); r.pill.className='pill '+i.state; r.pill.textContent=LABEL[i.state]||i.state; r.nm.textContent=i.name;
+  let m='';
+  if(i.state==='live') m=[i.info,i.audio,i.fps+' fps','live '+dur(i.live_for)].filter(Boolean).join(' · ');
+  else if(i.state==='offline') m=(i.error||'No signal')+(i.down_for?' · down '+dur(i.down_for):'')+' · retrying';
+  else if(i.state==='standby') m='No stream for '+dur(i.down_for)+' · lights up by itself';
+  else if(i.state==='connecting') m='Connecting...';
+  else m='No URL set';
+  r.meta.textContent=m;
+  [0,1].forEach(c=>{const v=i.state==='live'&&i.has_audio?i.levels[c]:null;
+   r.bars[c].style.width=(100-(v===null?0:Math.max(0,Math.min(100,(v+60)/60*100))))+'%';
+   r.dbs[c].textContent=i.state!=='live'?'':(i.has_audio===false?'no audio':(v===null?'silent':v.toFixed(1)+' dB'))});
+ });
+ const o=s.output;
+ $('sysinfo').textContent='Mode: '+s.mode+' · '+s.rate+' fps · viewers: '+s.viewers+
+  ' · network output: '+(o.enabled?(o.type.toUpperCase()+' '+(o.running?'running':'NOT running')+(o.connections!=null?' ('+o.connections+' receivers)':'')):'off');
+}
+let failed=false, boot=null;
+async function poll(){
+ try{
+  const r=await fetch('api/status',{cache:'no-store'});
+  if(r.status===401){location.replace('login');return}
+  const s=await r.json();
+  if((boot&&s.boot!==boot)||failed) startStream(true);
+  boot=s.boot; failed=false; $('banner').classList.remove('show'); $('dot').classList.remove('bad');
+  render(s);
+ }catch(e){ failed=true; $('banner').classList.add('show'); $('dot').classList.add('bad'); }
+}
+setInterval(poll,1000); poll();
+
+// settings drawer
+function openDrawer(){body.classList.add('open');loadConfig()}
+function closeDrawer(){body.classList.remove('open');wake()}
+$('gear').onclick=openDrawer; $('close').onclick=closeDrawer; $('scrim').onclick=closeDrawer;
+const H={'Content-Type':'application/json','X-MV':'1'};
+async function loadConfig(){
+ $('msg').textContent='';
+ const r=await fetch('api/config',{cache:'no-store'});
+ if(r.status===401){location.replace('login');return}
+ if(r.status===403){$('adminbox').hidden=false;$('cfg').hidden=true;$('apw').focus();return}
+ const c=await r.json(); $('adminbox').hidden=true; $('cfg').hidden=false; $('openwarn').hidden=!c.open;
+ $('caption').value=c.caption||'';
+ const box=$('chans'); box.textContent='';
+ c.inputs.forEach((i,k)=>{
+  const d=document.createElement('div'); d.className='card';
+  d.innerHTML='<div class="ch"><span></span><span class="pill"></span></div>'+
+   '<label>Title shown on the multiview</label><input class="in nm" maxlength="60">'+
+   '<label>Stream URL (rtmp://, srt://, https://...m3u8)</label>'+
+   '<div class="urlrow"><input class="in url" type="password" spellcheck="false" autocapitalize="off" placeholder="rtmp://server/app/streamkey">'+
+   '<button class="btn show" type="button">Show</button></div>';
+  d.querySelector('.ch span').textContent='Channel '+(k+1);
+  const p=d.querySelector('.pill'); p.className='pill '+i.state; p.textContent=LABEL[i.state]||i.state;
+  d.querySelector('.nm').value=i.name; d.querySelector('.url').value=i.url;
+  d.querySelector('.show').onclick=e=>{const u=d.querySelector('.url');u.type=u.type==='password'?'text':'password';e.target.textContent=u.type==='password'?'Show':'Hide'};
+  box.appendChild(d);
+ });
+}
+$('alogin').onclick=async()=>{
+ $('aerr').textContent='';
+ const r=await fetch('api/login',{method:'POST',headers:H,body:JSON.stringify({password:$('apw').value})});
+ $('apw').value='';
+ if(r.ok){loadConfig()} else {const j=await r.json().catch(()=>({}));$('aerr').textContent=j.error||'Error'}
+};
+$('apw').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('alogin').click()}};
+$('cfg').onsubmit=async e=>{
+ e.preventDefault();
+ const inputs=[...$('chans').children].map(d=>({name:d.querySelector('.nm').value,url:d.querySelector('.url').value}));
+ const r=await fetch('api/config',{method:'POST',headers:H,body:JSON.stringify({inputs,caption:$('caption').value})});
+ const j=await r.json().catch(()=>({}));
+ if(r.status===403){loadConfig();return}
+ $('msg').textContent=r.ok?'Saved':('Error: '+(j.error||r.status));
+ setTimeout(()=>{$('msg').textContent=''},4000);
+};
+$('logout').onclick=async()=>{await fetch('api/logout',{method:'POST',headers:H}).catch(()=>{});location.replace('login')};
+
+startStream(true); wakeLock();
+})();
+</script></body></html>"""
+
+MANIFEST = json.dumps({"name": "RTMP Multiview", "short_name": "Multiview", "start_url": "./",
+                       "display": "fullscreen", "background_color": "#000000",
+                       "theme_color": "#000000"}).encode()
+
+
+# ----------------------------------------------------------------------------
+# Web server
+# ----------------------------------------------------------------------------
+
+def make_handler(app, auth, proxies, tls):
+    wcfg = app.cfg["web"]
+    max_viewers = int(wcfg.get("max_viewers") or 20)
 
     class H(BaseHTTPRequestHandler):
+        server_version = "multiview"
+        sys_version = ""
+        timeout = 30                      # socket timeout while reading requests (slowloris)
+
         def log_message(self, *a):
             pass
 
-        def _send(self, code, body, ctype, extra=None):
+        # -- helpers --------------------------------------------------------
+        def client_ip(self):
+            ip = self.client_address[0]
+            if proxies.trusted(ip):
+                xff = self.headers.get("X-Forwarded-For", "")
+                if xff:
+                    return xff.split(",")[-1].strip() or ip
+            return ip
+
+        def https(self):
+            return tls or (proxies.trusted(self.client_address[0])
+                           and self.headers.get("X-Forwarded-Proto", "").lower() == "https")
+
+        def _common_headers(self, nonce=None):
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+            n = nonce or "none"
+            self.send_header("Content-Security-Policy",
+                             f"default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; "
+                             "img-src 'self' data:; connect-src 'self'; manifest-src 'self'; "
+                             "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+            if self.https():
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
+
+        def _send(self, code, body, ctype, extra=None, nonce=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
+            self._common_headers(nonce)
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
-        def _authorized(self):
-            if not password:
-                return True
-            h = self.headers.get("Authorization", "")
-            if h.startswith("Basic "):
-                try:
-                    _, _, pw = base64.b64decode(h[6:]).decode("utf-8", "replace").partition(":")
-                    if hmac.compare_digest(pw.encode(), password.encode()):
-                        return True
-                except Exception:
-                    pass
-            self._send(401, b"login required", "text/plain",
-                       {"WWW-Authenticate": 'Basic realm="RTMP Multiview"'})
-            return False
+        def _json(self, code, obj, extra=None):
+            self._send(code, json.dumps(obj).encode(), "application/json", extra)
+
+        def _page(self, html):
+            nonce = secrets.token_urlsafe(16)
+            self._send(200, html.replace("{{N}}", nonce).encode(), "text/html; charset=utf-8",
+                       nonce=nonce)
+
+        def _redirect(self, where):
+            self._send(303, b"", "text/plain", {"Location": where})
+
+        def _token(self):
+            from http.cookies import SimpleCookie
+            try:
+                c = SimpleCookie(self.headers.get("Cookie", ""))
+                m = c.get(Auth.COOKIE)
+                return m.value if m else None
+            except Exception:
+                return None
+
+        def _cookie(self, token, max_age):
+            attrs = f"{Auth.COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+            if self.https():
+                attrs += "; Secure"
+            return attrs
+
+        def _session(self):
+            """-> session dict, or None. Open mode: a pseudo session."""
+            if auth.open:
+                return {"admin_until": float("inf")}
+            return auth.session(self._token())
+
+        def _same_origin(self):
+            # custom header (forces a CORS preflight that we never answer) + Origin check
+            if self.headers.get("X-MV") != "1":
+                return False
+            origin = self.headers.get("Origin")
+            if origin:
+                host = self.headers.get("X-Forwarded-Host") if proxies.trusted(self.client_address[0]) else None
+                host = host or self.headers.get("Host", "")
+                if origin.split("://", 1)[-1].rstrip("/") != host:
+                    return False
+            return True
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 65536:
+                raise ValueError("request too large")
+            data = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(data, (dict, list)):
+                raise ValueError("bad request")
+            return data
+
+        # -- routes ---------------------------------------------------------
+        def do_HEAD(self):
+            self.do_GET()
 
         def do_GET(self):
-            if not self._authorized():
-                return
-            p = self.path.split("?")[0]
-            if p in ("/", "/index.html"):
-                self._send(200, PAGE.encode(), "text/html; charset=utf-8")
-            elif p == "/snapshot.jpg":
-                self._send(200, app.snapshot_jpeg(), "image/jpeg")
-            elif p == "/api/status":
-                self._send(200, json.dumps(app.status()).encode(), "application/json")
-            else:
-                self._send(404, b"not found", "text/plain")
+            path = self.path.split("?", 1)[0]
+            if path == "/healthz":
+                return self._send(200, b"ok", "text/plain")
+            if path == "/manifest.webmanifest":
+                return self._send(200, MANIFEST, "application/manifest+json")
+            if path in ("/favicon.ico", "/robots.txt"):
+                return self._send(200 if path == "/robots.txt" else 204,
+                                  b"User-agent: *\nDisallow: /\n" if path == "/robots.txt" else b"",
+                                  "text/plain")
+            s = self._session()
+            if path == "/login":
+                return self._redirect("./") if s else self._page(LOGIN_PAGE)
+            if path in ("/", "/index.html"):
+                return self._page(VIEWER_PAGE) if s else self._redirect("login")
+            if not s:
+                return self._json(401, {"error": "login required"})
+            if path == "/stream.mjpg":
+                return self._stream()
+            if path == "/snapshot.jpg":
+                return self._send(200, app.snapshot_jpeg(), "image/jpeg")
+            if path == "/api/status":
+                return self._json(200, app.status())
+            if path == "/api/config":
+                if not auth.is_admin(s, touch=True):
+                    return self._json(403, {"error": "admin password required"})
+                return self._json(200, app.config_view(auth))
+            self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
-            if not self._authorized():
-                return
-            if self.path.split("?")[0] != "/api/inputs":
-                return self._send(404, b"not found", "text/plain")
+            path = self.path.split("?", 1)[0]
+            if not self._same_origin():
+                return self._json(403, {"error": "cross-site request refused"})
             try:
-                n = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(min(n, 100000)))
-                caption = None
-                if isinstance(body, dict):          # {"inputs": [...], "caption": "..."}
-                    items, caption = body.get("inputs", []), body.get("caption")
-                else:                               # plain list (older UI)
-                    items = body
-                if not isinstance(items, list) or not all(isinstance(x, dict) for x in items):
-                    raise ValueError("expected a list of {name, url}")
-                app.save_inputs(items, caption)
-                self._send(200, b'{"ok":true}', "application/json")
-            except Exception as e:
-                self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+                if path == "/api/login":
+                    body = self._body()
+                    pw = body.get("password") if isinstance(body, dict) else None
+                    if auth.open:
+                        return self._json(200, {"ok": True})
+                    token, err = auth.login(pw if isinstance(pw, str) else "", self.client_ip(),
+                                            old_token=self._token())
+                    if not token:
+                        return self._json(429 if "Too many" in err else 401, {"error": err})
+                    return self._json(200, {"ok": True},
+                                      {"Set-Cookie": self._cookie(token, int(auth.session_s))})
+                if path == "/api/logout":
+                    auth.logout(self._token())
+                    return self._json(200, {"ok": True}, {"Set-Cookie": self._cookie("", 0)})
+                s = self._session()
+                if not s:
+                    return self._json(401, {"error": "login required"})
+                if path in ("/api/config", "/api/inputs"):
+                    if not auth.is_admin(s, touch=True):
+                        return self._json(403, {"error": "admin password required"})
+                    body = self._body()
+                    caption = None
+                    if isinstance(body, dict):
+                        items, caption = body.get("inputs", []), body.get("caption")
+                    else:
+                        items = body
+                    if not isinstance(items, list) or not all(isinstance(x, dict) for x in items):
+                        raise ValueError("expected a list of {name, url}")
+                    app.save_inputs(items, caption)
+                    log.info("web: settings changed from %s", self.client_ip())
+                    return self._json(200, {"ok": True})
+                self._send(404, b"not found", "text/plain")
+            except (ValueError, json.JSONDecodeError) as e:
+                self._json(400, {"error": str(e)})
+
+        def _stream(self):
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            want = dict(p.split("=", 1) for p in qs.split("&") if "=" in p).get("p", "")
+            ps = app.previews.get(want) or app.previews.get("sd") or next(iter(app.previews.values()), None)
+            if ps is None:
+                return self._send(404, b"no stream profiles configured", "text/plain")
+            if sum(p.viewers for p in app.previews.values()) >= max_viewers:
+                return self._send(503, b"too many viewers", "text/plain")
+            token = self._token()
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=mvframe")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")       # nginx: don't buffer
+            self.send_header("Connection", "close")
+            self._common_headers()
+            self.end_headers()
+            ps.acquire()
+            try:
+                self.connection.settimeout(20)
+                last, checked = -1, time.monotonic()
+                while not app.stopping.is_set():
+                    seq, jpg = ps.wait_next(last, 5.0)
+                    now = time.monotonic()
+                    if now - checked > 10:                  # stop when logged out / expired
+                        checked = now
+                        if not auth.open and not auth.session(token, touch=False):
+                            break
+                    if jpg is None or seq == last:
+                        continue
+                    last = seq
+                    self.wfile.write(b"--mvframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                     + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                    self.wfile.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                ps.release()
+
     return H
 
 
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="RTMP Multiview: 4 stream pulls -> 2x2 grid -> NDI/OMT")
-    ap.add_argument("config", nargs="?", default=DEFAULT_CONFIG_PATH,
-                    help=f"config file (default {DEFAULT_CONFIG_PATH}, created if missing)")
+    default_cfg = os.environ.get("MV_CONFIG") or DEFAULT_CONFIG_PATH
+    ap.add_argument("config", nargs="?", default=default_cfg,
+                    help=f"config file (default {default_cfg}, created if missing)")
+    ap.add_argument("--hash-password", action="store_true",
+                    help="ask for a password, print its hash for web.password / MV_PASSWORD, and exit")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--display", dest="display", action="store_true", default=None,
                    help="show the multiview in a window (needs a desktop)")
@@ -1710,6 +2416,15 @@ def main():
     ap.add_argument("--fullscreen", action="store_true", help="window in fullscreen (implies --display)")
     ap.add_argument("--no-output", action="store_true", help="don't send NDI/OMT, ignore output.enabled")
     args = ap.parse_args()
+    if args.hash_password:
+        import getpass
+        pw = getpass.getpass("New web password: ")
+        if len(pw) < 8:
+            sys.exit("Use at least 8 characters (better: a long passphrase).")
+        if getpass.getpass("Repeat: ") != pw:
+            sys.exit("The passwords don't match.")
+        print(hash_password(pw))
+        return
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     overrides = {}
@@ -1730,13 +2445,36 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     w = app.cfg["web"]
+    auth = Auth(w)
+    if auth.open:
+        if os.environ.get("MV_REQUIRE_PASSWORD") == "1":
+            log.error("No web password set. Set MV_PASSWORD (plain or a hash from --hash-password) "
+                      "or web.password in the config, or MV_REQUIRE_PASSWORD=0 for an open LAN-only setup.")
+            sys.exit(2)
+        if w.get("bind", "0.0.0.0") not in ("127.0.0.1", "::1", "localhost"):
+            log.warning("web UI has NO PASSWORD - anyone who can reach port %s can watch and change "
+                        "stream keys. Set web.password before exposing it.", w.get("port"))
+    for name, val in (("password", auth.view_pw), ("admin_password", auth.admin_pw)):
+        if val and not val.startswith("pbkdf2_sha256$"):
+            log.warning("web %s is stored in plain text; consider a hash from --hash-password", name)
+    tp = os.environ.get("MV_TRUSTED_PROXIES")
+    proxies = TrustedProxies(tp.split(",") if tp else (w.get("trusted_proxies") or []))
     if w.get("port"):
         try:
-            srv = ThreadingHTTPServer((w.get("bind", "0.0.0.0"), int(w["port"])), make_handler(app))
+            srv = ThreadingHTTPServer((w.get("bind", "0.0.0.0"), int(w["port"])),
+                                      make_handler(app, auth, proxies, bool(w.get("tls_cert"))))
             srv.daemon_threads = True
+            scheme = "http"
+            if w.get("tls_cert") and w.get("tls_key"):
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(w["tls_cert"], w["tls_key"])
+                srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+                scheme = "https"
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-            log.info("web UI on http://%s:%s/", w.get("bind", "0.0.0.0"), w["port"])
-        except OSError as e:
+            log.info("web UI on %s://%s:%s/ (%s)", scheme, w.get("bind", "0.0.0.0"), w["port"],
+                     "no login" if auth.open else "login required")
+        except (OSError, ssl.SSLError) as e:
             log.error("web UI disabled - cannot listen on port %s: %s", w["port"], e)
     app.run()
 
