@@ -3,6 +3,10 @@
 #   docker run -d -p 8080:8080 -e MV_PASSWORD=... -v ./config:/config rtmp-multiview
 FROM debian:trixie-slim
 
+LABEL org.opencontainers.image.source="https://github.com/RedMoreBlue/rtmp-multiview" \
+      org.opencontainers.image.title="RTMP Multiview (developed with AI)" \
+      org.opencontainers.image.description="2x2 multiviewer for RTMP/HLS/SRT feeds with tallies, audio meters and clock, viewed live in the browser"
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3 python3-numpy python3-pil ffmpeg fonts-dejavu-core ca-certificates \
