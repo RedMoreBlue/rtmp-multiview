@@ -335,6 +335,7 @@ class Input:
         self._lines = deque(maxlen=30)
         self.proc = None
         self.wake = threading.Event()
+        self._manual = False         # "Retry now" pressed: next attempt starts at once
         self.stopping = False
         self.thread = threading.Thread(target=self._run, name=f"input{idx + 1}", daemon=True)
         self.watch = threading.Thread(target=self._watchdog, name=f"watch{idx + 1}", daemon=True)
@@ -358,6 +359,22 @@ class Input:
             self.state = STATE_UNSET if not url else STATE_CONNECTING
             self._kill()
             self.wake.set()
+
+    def retry(self):
+        """Reconnect now (web UI "Retry"): leaves standby, cancels the wait for the next
+        attempt and restarts an attempt that hasn't produced a picture yet."""
+        if not self.url or self.stopping or self.state == STATE_LIVE:
+            return False
+        log.info("[%d] retry requested", self.idx + 1)
+        self.failed = False
+        self.standby = False
+        self.down_since = 0.0
+        self.state = STATE_CONNECTING
+        self._manual = True
+        if not self._got_frame:
+            self._kill()
+        self.wake.set()
+        return True
 
     def stop(self):
         self.stopping = True
@@ -628,6 +645,7 @@ class Input:
             self._lines.clear()
             self._kill_reason = None
             self._got_frame = False
+            self._manual = False
             self.started_t = time.monotonic()
             self.attempts += 1
             log.debug("[%d] connecting (attempt %d)", self.idx + 1, self.attempts)
@@ -670,6 +688,10 @@ class Input:
             if self.stopping:
                 break
             if url != self.url:          # changed by the web UI; reconnect at once
+                continue
+            if self._manual and not was_live:   # "Retry now" killed this attempt: start over
+                self._manual = False
+                self.wake.clear()
                 continue
             self.last_error = redact(self._reason(was_live, rc), url)
             if was_live or not self.failed:
@@ -2002,6 +2024,20 @@ label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px}
 .in{width:100%;padding:10px;border-radius:7px;border:1px solid #33363d;background:#0b0c0f;color:var(--fg);font:16px ui-monospace,Menlo,Consolas,monospace}
 .urlrow{display:flex;gap:6px}
 .urlrow .in{flex:1;min-width:0}
+.urlrow .btn{flex:none;background:rgba(255,255,255,.07)}
+.urlrow .retry:disabled{opacity:.35;cursor:default}
+.ch .rmsg{margin-left:auto;font-weight:400}
+/* Phones: the settings page scrolls as a normal page instead of a fixed panel with its own
+   scrolling. iOS WebKit (Safari and Chrome on iPhone) misplaces the text cursor and jumps
+   the scroll position in fixed scrolling panels when the keyboard opens. */
+@media (max-width:700px),(max-height:500px){
+ body.open{overflow:auto}
+ body.open #stage,body.open #list,body.open #hud,body.open #scrim,body.open #banner{display:none}
+ body.open #drawer{position:relative;inset:auto;width:100%;min-height:100%;transform:none;transition:none;overflow:visible;border-left:0;
+  padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+ #drawer{visibility:hidden}
+ body.open #drawer{visibility:visible}
+}
 .primary{background:#3b6ef5;color:#fff;font-weight:600;height:44px;padding:0 20px}
 .primary:hover{background:#4d7bf6}
 .note{color:var(--mut);font-size:12.5px}
@@ -2102,6 +2138,7 @@ function render(s){
   else if(i.state==='connecting') m='Connecting...';
   else m='No URL set';
   r.meta.textContent=m;
+  if(cards[i.index]){cards[i.index].state=i.state;cardState(i.index,i.state)}
   [0,1].forEach(c=>{const v=i.state==='live'&&i.has_audio?i.levels[c]:null;
    r.bars[c].style.width=(100-(v===null?0:Math.max(0,Math.min(100,(v+60)/60*100))))+'%';
    r.dbs[c].textContent=i.state!=='live'?'':(i.has_audio===false?'no audio':(v===null?'silent':v.toFixed(1)+' dB'))});
@@ -2124,8 +2161,20 @@ async function poll(){
 setInterval(poll,1000); poll();
 
 // settings drawer
-function openDrawer(){body.classList.add('open');loadConfig()}
-function closeDrawer(){body.classList.remove('open');wake()}
+const phoneDrawer=()=>matchMedia('(max-width:700px),(max-height:500px)').matches;
+let pageY=0;
+function openDrawer(){pageY=scrollY;body.classList.add('open');if(phoneDrawer())scrollTo(0,0);loadConfig()}
+function closeDrawer(){if(!body.classList.contains('open'))return;
+ if(document.activeElement&&document.activeElement.blur)document.activeElement.blur();
+ body.classList.remove('open');if(phoneDrawer())scrollTo(0,pageY);wake()}
+// keep the page where it is when a button is tapped (iOS scrolls to the top otherwise)
+function keepScroll(fn){const y=scrollY,dt=$('drawer').scrollTop;fn();
+ const back=()=>{scrollTo(0,y);$('drawer').scrollTop=dt};back();requestAnimationFrame(back);setTimeout(back,350)}
+const cards={};
+function cardState(k,st){const c=cards[k];if(!c)return;
+ c.pill.className='pill '+st; c.pill.textContent=LABEL[st]||st;
+ c.retry.disabled=(st==='live'||st==='unset'||!c.saved);
+ c.retry.title=st==='live'?'Already live':st==='unset'?'No URL set':!c.saved?'Save first':'Reconnect now (also wakes it from standby)'}
 $('gear').onclick=openDrawer; $('close').onclick=closeDrawer; $('scrim').onclick=closeDrawer;
 const H={'Content-Type':'application/json','X-MV':'1'};
 async function loadConfig(){
@@ -2135,18 +2184,32 @@ async function loadConfig(){
  if(r.status===403){$('adminbox').hidden=false;$('cfg').hidden=true;$('apw').focus();return}
  const c=await r.json(); $('adminbox').hidden=true; $('cfg').hidden=false; $('openwarn').hidden=!c.open;
  $('caption').value=c.caption||'';
- const box=$('chans'); box.textContent='';
+ const box=$('chans'); box.textContent=''; for(const k in cards)delete cards[k];
  c.inputs.forEach((i,k)=>{
   const d=document.createElement('div'); d.className='card';
   d.innerHTML='<div class="ch"><span></span><span class="pill"></span></div>'+
    '<label>Title shown on the multiview</label><input class="in nm" maxlength="60">'+
    '<label>Stream URL (rtmp://, srt://, https://...m3u8)</label>'+
    '<div class="urlrow"><input class="in url" type="password" spellcheck="false" autocapitalize="off" placeholder="rtmp://server/app/streamkey">'+
-   '<button class="btn show" type="button">Show</button></div>';
+   '<button class="btn show" type="button">Show</button><button class="btn retry" type="button">Retry</button></div>';
   d.querySelector('.ch span').textContent='Channel '+(k+1);
-  const p=d.querySelector('.pill'); p.className='pill '+i.state; p.textContent=LABEL[i.state]||i.state;
-  d.querySelector('.nm').value=i.name; d.querySelector('.url').value=i.url;
-  d.querySelector('.show').onclick=e=>{const u=d.querySelector('.url');u.type=u.type==='password'?'text':'password';e.target.textContent=u.type==='password'?'Show':'Hide'};
+  const rmsg=document.createElement('span'); rmsg.className='rmsg note'; d.querySelector('.ch').appendChild(rmsg);
+  const u=d.querySelector('.url'), show=d.querySelector('.show'), retry=d.querySelector('.retry');
+  d.querySelector('.nm').value=i.name; u.value=i.url;
+  const c=cards[k+1]={pill:d.querySelector('.pill'),retry,saved:true};
+  u.oninput=()=>{c.saved=u.value.trim()===i.url;cardState(k+1,c.state)};
+  // don't let the buttons steal focus from the field (closes the keyboard and scrolls on iOS)
+  [show,retry].forEach(b=>b.addEventListener('mousedown',e=>e.preventDefault()));
+  show.onclick=()=>keepScroll(()=>{u.type=u.type==='password'?'text':'password';show.textContent=u.type==='password'?'Show':'Hide'});
+  retry.onclick=async()=>{
+   retry.disabled=true; rmsg.textContent='Retrying...';
+   const r=await fetch('api/retry',{method:'POST',headers:H,body:JSON.stringify({index:k+1})}).catch(()=>null);
+   const j=r?await r.json().catch(()=>({})):{};
+   rmsg.textContent=!r||!r.ok?'Error: '+(j.error||(r?r.status:'offline')):j.ok?'Reconnecting now':'Nothing to retry';
+   if(r&&r.ok&&j.ok){c.state='connecting';cardState(k+1,'connecting')}
+   setTimeout(()=>{rmsg.textContent=''},4000);
+  };
+  c.state=i.state; cardState(k+1,i.state);
   box.appendChild(d);
  });
 }
@@ -2340,6 +2403,15 @@ def make_handler(app, auth, proxies, tls):
                 s = self._session()
                 if not s:
                     return self._json(401, {"error": "login required"})
+                if path == "/api/retry":
+                    body = self._body()
+                    idx = body.get("index") if isinstance(body, dict) else None
+                    if not isinstance(idx, int) or not 1 <= idx <= len(app.inputs):
+                        raise ValueError("index must be 1..4")
+                    ok = app.inputs[idx - 1].retry()
+                    if ok:
+                        log.info("web: retry channel %d from %s", idx, self.client_ip())
+                    return self._json(200, {"ok": ok})
                 if path in ("/api/config", "/api/inputs"):
                     if not auth.is_admin(s, touch=True):
                         return self._json(403, {"error": "admin password required"})

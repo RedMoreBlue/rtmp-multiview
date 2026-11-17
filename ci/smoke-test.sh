@@ -76,6 +76,11 @@ curl -s -b "$JAR" --max-time 6 "$BASE/stream.mjpg?p=mobile" -o "$CFG/stream.bin"
 n=$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().count(b"\xff\xd9"))' "$CFG/stream.bin")
 [ "$n" -ge 10 ] && pass "MJPEG stream delivered $n frames in 6 s" || fail "MJPEG stream delivered only $n frames"
 
+code=$(curl -s -b "$JAR" -o "$CFG/retry.json" -w '%{http_code}' -H 'X-MV: 1' -H 'Content-Type: application/json' -d '{"index":2}' "$BASE/api/retry")
+[ "$code" = "200" ] && grep -q '"ok": true' "$CFG/retry.json" && pass "retry an offline channel" || fail "retry gave $code $(cat "$CFG/retry.json")"
+code=$(curl -s -b "$JAR" -o "$CFG/retry.json" -w '%{http_code}' -H 'X-MV: 1' -H 'Content-Type: application/json' -d '{"index":1}' "$BASE/api/retry")
+[ "$code" = "200" ] && grep -q '"ok": false' "$CFG/retry.json" && pass "retry on a live channel is a no-op" || fail "retry on live gave $code $(cat "$CFG/retry.json")"
+
 cfgcode=$(curl -s -b "$JAR" -o "$CFG/cfg.json" -w '%{http_code}' "$BASE/api/config")
 [ "$cfgcode" = "200" ] && grep -q "$KEY" "$CFG/cfg.json" && pass "settings readable after login (single password)" || fail "api/config gave $cfgcode"
 

@@ -42,6 +42,11 @@ A "check" is one short ffmpeg connection attempt to the stream URL, which costs 
 nothing. With `"output": {"enabled": false}` and no window, it composes only for the web
 preview and uses about 2%. Set `standby_after` to `0` to never go to standby.
 
+To test a stream right away without waiting for the next check, press **Retry** next to the
+channel's URL in ⚙ settings. It connects at once and takes the channel out of standby. It
+does nothing on a channel that's already LIVE, and any logged-in user may use it (the
+`/api/retry` endpoint), not only the admin.
+
 ## Web multiviewer
 
 Open `http://<host>:8080/` and log in. The page is just the live multiview, scaled to the
@@ -53,7 +58,8 @@ move the mouse or tap:
 - **Auto / HD / SD / Mobile** picks the stream quality (Auto chooses by screen size)
 - fullscreen
 - **⚙ settings**: channel titles, stream URLs (keys hidden until you press *Show*), the text
-  under the clock, sign out. Only a tile whose URL changed reconnects.
+  under the clock, sign out. Only a tile whose URL changed reconnects. **Retry** next to a
+  URL reconnects that channel immediately, also out of standby.
 
 **On a phone in portrait** you get the picture on top and a readable list under it: tally,
 name, codec/resolution/fps and audio bars per channel. Turn the phone sideways for the full
